@@ -1,0 +1,19 @@
+meta {
+  name: Ready
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/ready
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Dependencies: postgres, redis, embeddings. Without `supabase start` this correctly reports `postgres: unavailable` while /health stays 200.
+}

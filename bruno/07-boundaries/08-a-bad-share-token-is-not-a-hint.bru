@@ -1,0 +1,23 @@
+meta {
+  name: A bad share token is not a hint
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/api/v1/exam/0000000000000000000000000000dead
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 404
+}
+
+docs {
+  A wrong token and a token for a paper that was never published give the same answer, so
+  the endpoint cannot be used to probe which tokens exist.
+
+  The token is 128 bits from `gen_random_bytes`. Guessing is not the threat model;
+  leaking through error messages is.
+}

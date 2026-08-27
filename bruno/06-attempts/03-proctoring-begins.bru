@@ -1,0 +1,52 @@
+meta {
+  name: Proctoring begins
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/proctor-session
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+script:post-response {
+  bru.setEnvVar("proctorSessionId", res.body.id);
+}
+
+assert {
+  res.status: eq 201
+  res.body.status: eq active
+}
+
+tests {
+  test("the session payload carries nothing evaluative", function () {
+    const raw = JSON.stringify(res.getBody());
+    expect(raw).to.not.contain("integrity_score");
+    expect(raw).to.not.contain("review_status");
+    expect(raw).to.not.contain("released");
+  });
+  test("cadence and the baseline target come from the server", function () {
+    const session = res.getBody();
+    expect(session.heartbeat_interval_seconds).to.be.a("number");
+    expect(session.event_batch_interval_seconds).to.be.a("number");
+    expect(session.baseline_upload_url).to.be.a("string");
+  });
+}
+
+docs {
+  In the browser this follows a consent screen: what is recorded, for how long, who
+  sees it, and that a human reviews it. The response is the capture loop's contract —
+  cadence and a signed upload URL for the consented baseline still. Nothing
+  evaluative, because it is served to the person being observed.
+
+  The paper published in `05-assessments` has `proctoring_enabled: true`; a paper
+  whose author did not choose proctoring refuses to open a session at all.
+
+  Re-running resumes the same session (`already_active: true`) — a reload mid-exam
+  must not fork the record.
+}

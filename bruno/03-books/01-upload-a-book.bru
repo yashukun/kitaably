@@ -1,0 +1,45 @@
+meta {
+  name: Upload a book
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/books
+  body: multipartForm
+  auth: inherit
+}
+
+body:multipart-form {
+  file: @file(fixtures/sample-book.md)
+  title: Biology — Photosynthesis
+}
+
+
+assert {
+  res.status: eq 202
+  res.body.status: eq uploaded
+}
+
+tests {
+  test("lands private, not shared", function () {
+    expect(res.getStatus()).to.equal(202);
+  });
+}
+
+script:post-response {
+  bru.setEnvVar("bookId", res.body.id);
+  // Ingest is a Celery task: parse -> chapters -> chunk -> embed -> store. Small files
+  // finish in under a second; a 600-page PDF takes minutes. Give it a moment so the
+  // next request sees `ready` rather than `parsing`.
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+}
+
+docs {
+  202, not 201: the row exists but the document is not readable yet. Poll `Get a book`
+  for `status`.
+
+  There is no `scope` field on this request and there never will be. Every upload lands
+  `personal`; sharing is a separate, deliberate act (`Share with everyone`). A file
+  picker is not where "everyone can now read this" gets decided.
+}

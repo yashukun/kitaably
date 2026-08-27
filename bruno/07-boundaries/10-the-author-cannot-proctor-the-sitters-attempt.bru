@@ -1,0 +1,31 @@
+meta {
+  name: The author cannot proctor the sitter's attempt
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/proctor-session
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 404
+}
+
+tests {
+  test("404, not 403", function () {
+    expect(res.getStatus()).to.equal(404);
+  });
+}
+
+docs {
+  The capture routes are the sitter's alone (`require_attempt_sitter`): only the
+  person being observed feeds the record of their own observation. The author reads
+  the record — through the review gate, in Phase 8 — and writes verdicts, never
+  events. An author who could inject events into a sitting they mark would be a
+  witness who can edit the testimony.
+
+  This request runs with the collection's default bearer, which is the author.
+}

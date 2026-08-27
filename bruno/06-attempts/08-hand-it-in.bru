@@ -1,0 +1,35 @@
+meta {
+  name: Hand it in
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/submit
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("no marks are handed back at submit time", function () {
+    const result = res.getBody();
+    expect(result.released).to.equal(false);
+    expect(result.score).to.equal(null);
+  });
+}
+
+docs {
+  Idempotent: a double-clicked button, a retried request and a browser firing both
+  `beforeunload` and the button must all land in the same place.
+
+  Queues the paper for marking — MCQ deterministically, written answers by LLM against
+  the stored rubric. Nothing is marked in the request.
+}

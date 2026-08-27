@@ -1,0 +1,35 @@
+meta {
+  name: Override a mark
+  type: http
+  seq: 11
+}
+
+patch {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/answers/{{firstQuestionId}}/grade
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "awarded_points": 1,
+    "feedback": "Marked up by hand — the reasoning was sound."
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Back to the **author's** token (`auth: inherit`), because this is the author's act.
+
+  Sets `grader='human'` and **preserves** `llm_rationale`. Keeping the machine's original
+  judgement is what makes an override a correction rather than a cover-up: if the mark is
+  later disputed, both what the model said and what the human decided are on the record.
+
+  `attempts.score` is re-derived from the answers afterwards. Never store a score that
+  cannot be recomputed from its parts.
+
+  Out of range is refused — a three-mark question cannot award four. Audited.
+}

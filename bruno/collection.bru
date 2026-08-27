@@ -1,0 +1,23 @@
+auth {
+  mode: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+docs {
+  # Kitaably API
+
+  Every request inherits a bearer token from this collection. `00-auth` fills it in —
+  run that first, or run the whole collection top to bottom.
+
+  The folders are numbered because they build on each other: books before assessments,
+  assessments before attempts. `bru run --env local -r` walks the whole product in one
+  pass: upload a book, share it, ask the tutor, generate a paper, publish it, sit it,
+  mark it, release it.
+
+  `07-boundaries` is the interesting folder. Every request in it is *expected to fail* —
+  they assert 404, because that is what this API returns when you reach for something
+  that is not yours. Not 403: a 403 on somebody else's row confirms the row exists.
+}

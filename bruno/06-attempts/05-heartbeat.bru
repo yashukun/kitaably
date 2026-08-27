@@ -1,0 +1,27 @@
+meta {
+  name: Heartbeat
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/proctor-session/heartbeat
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+assert {
+  res.status: eq 204
+}
+
+docs {
+  Proof of life, every ~15s in the browser. Its absence is the signal that matters:
+  the easiest attack on a browser-side detector is to stop reporting, so the sweep
+  task turns silence past `HEARTBEAT_GAP_SECONDS` into a `heartbeat_gap` event.
+  A suspiciously clean session with a four-minute reporting hole is not a clean
+  session — and the record says so without the client's help.
+}

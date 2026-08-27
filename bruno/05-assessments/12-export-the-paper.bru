@@ -1,0 +1,52 @@
+meta {
+  name: Export the paper
+  type: http
+  seq: 12
+}
+
+get {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}/export?format=json
+  body: none
+  auth: inherit
+}
+
+params:query {
+  format: json
+}
+
+assert {
+  res.status: eq 200
+  res.headers["content-disposition"]: contains attachment
+}
+
+docs {
+  The whole paper as a file: every question with its answer, rubric, options, pairs,
+  cognitive level, origin and the chunk ids it was written from. `format=md` returns
+  the same paper as a document instead — questions first, answer key in its own
+  section, so the first half can be printed for a room.
+
+  **Guarded to the author, not to anyone who can see the row.** This body is the answer
+  key. A sitter with a *released* result — who can legitimately read
+  `public.question_key` for their own attempt — still gets 404 here, because being
+  entitled to your own marked paper is not the same as being entitled to the paper.
+
+  **No audit row.** An author reading `GET /assessments/{id}` is already handed every
+  field in this file, so the export is a reformatting of a disclosure that has already
+  happened rather than a new one. Auditing the download while leaving the screen
+  unaudited would be theatre. The chat export makes the same call for the same reason.
+
+  **The share token is deliberately absent from the body.** It is the whole access
+  grant to the paper (DECISIONS.md D16), so it is a credential — and an export is a
+  file that gets emailed, synced and forwarded. It stays on the review screen where it
+  is visibly a link rather than one more field in a document. `tests/test_assessment_export.py`
+  asserts it never appears in either format.
+
+  Attempts are absent for a different reason: who sat the paper and what they scored is
+  a document about other people, and it is not what "export the assessment" asks for.
+  The gradebook is `GET /assessments/{id}/attempts`.
+
+  `format` in the JSON is a version tag (`kitaably.assessment.v1`), so a future shape
+  change is detectable by whatever was written against this one. Each question carries
+  BOTH `format` (the shape) and `type` (the family that marks it) — an importer needs
+  both, and one without the other cannot reconstruct the question (DECISIONS.md D25).
+}

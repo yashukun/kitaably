@@ -1,0 +1,48 @@
+# Secrets. This line is load-bearing: .env holds the service-role key, which
+# bypasses RLS. It must never be committed, and never baked into an image.
+.env
+.env.*
+!.env.example
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node / Next
+node_modules/
+.next/
+next-env.d.ts
+out/
+*.tsbuildinfo
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
+
+# Model weights and caches
+.cache/
+*.onnx
+
+# Terraform (Phase 10)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# OS / editor
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Assistant-local instructions and skills; not part of the product
+CLAUDE.md
+.claude/

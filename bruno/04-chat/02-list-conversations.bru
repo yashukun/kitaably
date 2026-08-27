@@ -1,0 +1,20 @@
+meta {
+  name: List conversations
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/v1/chat/sessions
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Yours only. Nobody reads anybody else's — there is no policy on `chat_sessions` that
+  would let them, and no account that outranks it.
+}

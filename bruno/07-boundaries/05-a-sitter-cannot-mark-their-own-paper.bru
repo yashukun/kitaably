@@ -1,0 +1,40 @@
+meta {
+  name: A sitter cannot mark their own paper
+  type: http
+  seq: 5
+}
+
+patch {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/answers/{{firstQuestionId}}/grade
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+body:json {
+  {
+    "awarded_points": 99
+  }
+}
+
+assert {
+  res.status: eq 404
+}
+
+tests {
+  test("404, not 403", function () {
+    expect(res.getStatus()).to.equal(404);
+  });
+}
+
+docs {
+  The obvious attack, refused by `require_attempt_author`.
+
+  Deliberately a different guard from `require_attempt_participant`: the sitter may
+  *read* their attempt and the author may too, but marking and releasing are the author's
+  acts alone. One guard admitting both would be a single service-layer omission away from
+  letting somebody mark their own paper.
+}

@@ -1,0 +1,294 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   Kitaably — glass over paper.
+
+   The product is a layer laid over a teacher's own book, so the frosted surfaces
+   read as sheets of parchment lit from behind rather than the usual cold panes
+   over a neon gradient. The ground is ink; the glass is the paper.
+   ========================================================================== */
+
+@theme {
+  --color-ink: #14110e;
+  --color-walnut: #241e18;
+  --color-bark: #3a3029;
+  --color-parchment: #f2ead9;
+  --color-parchment-dim: #b9ae9b;
+  --color-indigo: #5b78e6;
+  --color-saffron: #e08a3c;
+
+  /* Scope is the product's central idea, so it gets colour rather than a grey
+     label. These two are never used for anything else. */
+  --color-canon: #7fa07e;
+  --color-personal: #a97cb8;
+
+  --color-danger: #d4674f;
+
+  --font-display: var(--font-fraunces), Georgia, serif;
+  --font-sans: var(--font-plex-sans), system-ui, sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, monospace;
+
+  --radius-glass: 1.25rem;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background-color: var(--color-ink);
+  color: var(--color-parchment);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+
+  /* The backdrop the glass sits over: two warm pools of light behind the page,
+     plus a fibre texture so the blur has something to actually diffuse. Without
+     texture underneath, backdrop-filter has nothing to do and the panels read as
+     flat translucent rectangles. */
+  background-image:
+    radial-gradient(52rem 34rem at 8% -6%, rgb(91 120 230 / 0.32), transparent 62%),
+    radial-gradient(44rem 30rem at 96% 4%, rgb(224 138 60 / 0.26), transparent 64%),
+    radial-gradient(38rem 30rem at 68% 52%, rgb(169 124 184 / 0.16), transparent 62%),
+    radial-gradient(46rem 38rem at 30% 108%, rgb(127 160 126 / 0.18), transparent 62%);
+  background-attachment: fixed;
+}
+
+/* Paper fibre. A tiny repeating grain, kept very low contrast — it should be felt
+   rather than seen, and it is what stops large dark areas looking like flat CSS. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.5;
+  background-image:
+    repeating-linear-gradient(
+      113deg,
+      rgb(242 234 217 / 0.014) 0px,
+      rgb(242 234 217 / 0.014) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    repeating-linear-gradient(
+      7deg,
+      rgb(0 0 0 / 0.05) 0px,
+      rgb(0 0 0 / 0.05) 1px,
+      transparent 1px,
+      transparent 4px
+    );
+}
+
+@layer components {
+  /* The glass itself. Warm-tinted, not blue: it is parchment, not a window. */
+  .glass {
+    background: linear-gradient(
+      148deg,
+      rgb(242 234 217 / 0.14) 0%,
+      rgb(242 234 217 / 0.07) 42%,
+      rgb(242 234 217 / 0.035) 100%
+    );
+    background-clip: padding-box;
+    backdrop-filter: blur(28px) saturate(1.6);
+    -webkit-backdrop-filter: blur(28px) saturate(1.6);
+    border: 1px solid rgb(242 234 217 / 0.17);
+    border-radius: var(--radius-glass);
+
+    /* The top highlight is what sells a pane as a physical sheet: a lit edge
+       where it catches the light, and depth beneath it. */
+    box-shadow:
+      inset 0 1px 0 0 rgb(242 234 217 / 0.16),
+      inset 0 -1px 0 0 rgb(0 0 0 / 0.2),
+      0 18px 44px -24px rgb(0 0 0 / 0.75);
+  }
+
+  .glass-raised {
+    background: linear-gradient(
+      148deg,
+      rgb(242 234 217 / 0.16) 0%,
+      rgb(242 234 217 / 0.08) 100%
+    );
+    background-clip: padding-box;
+    backdrop-filter: blur(34px) saturate(1.7);
+    -webkit-backdrop-filter: blur(34px) saturate(1.7);
+    border: 1px solid rgb(242 234 217 / 0.22);
+    border-radius: var(--radius-glass);
+    box-shadow:
+      inset 0 1px 0 0 rgb(242 234 217 / 0.22),
+      0 26px 60px -28px rgb(0 0 0 / 0.85);
+  }
+
+  /* A citation slip: a fragment of page showing through, torn along one edge.
+     This is the signature element — the whole product thesis is "you can go and
+     check", so the source is treated as an object, not a footnote. */
+  .slip {
+    background: linear-gradient(
+      160deg,
+      rgb(242 234 217 / 0.14) 0%,
+      rgb(242 234 217 / 0.06) 100%
+    );
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgb(242 234 217 / 0.12);
+    border-left-width: 3px;
+    border-radius: 0.5rem 0.85rem 0.85rem 0.5rem;
+  }
+
+  /* The composer bar. It is `position: sticky`, so the transcript scrolls UNDER it —
+     which means it is the one surface in the product that must not be see-through.
+     `.glass-raised` is 8-16% parchment over a blur, and a blur does not hide text: it
+     smears it, so answers slid under the input and sat there as legible ghosting
+     behind whatever was being typed. This is the same warm sheet, made opaque. */
+  .composer {
+    background: linear-gradient(148deg, rgb(36 30 24 / 0.94) 0%, rgb(20 17 14 / 0.96) 100%);
+    background-clip: padding-box;
+    backdrop-filter: blur(28px) saturate(1.6);
+    -webkit-backdrop-filter: blur(28px) saturate(1.6);
+    border: 1px solid rgb(242 234 217 / 0.16);
+    border-radius: var(--radius-glass);
+    /* Forces the blur to composite inside the rounded clip instead of bleeding
+       past it at the corners, which is what read as a "rough edge". */
+    isolation: isolate;
+
+    /* Soft and gradual rather than a hard band: a lower-alpha, wider-blur pair
+       with almost no negative spread, so the bar reads as floating above the
+       page instead of sitting on a dark rectangle. */
+    box-shadow:
+      inset 0 1px 0 0 rgb(242 234 217 / 0.12),
+      0 -6px 32px -10px rgb(0 0 0 / 0.45),
+      0 26px 56px -22px rgb(0 0 0 / 0.55);
+  }
+
+  /* A short gradient directly above the composer, so the last line of an answer
+     dissolves into the page instead of being guillotined by the bar's top edge.
+     Its lowest stop matches the composer's own top tone exactly, so the two
+     hand off without a visible seam where they meet. */
+  .composer-fade {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 100%;
+    height: 3.25rem;
+    pointer-events: none;
+    background: linear-gradient(to top, rgb(36 30 24 / 0.94), rgb(36 30 24 / 0));
+  }
+
+  /* One conversation in the sidebar. Stacked, not a dropdown: the transcript list is
+     navigation, and navigation you have to open to read is navigation you forget. */
+  .thread {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border-radius: 0.7rem;
+    padding: 0.5rem 0.7rem;
+    color: var(--color-parchment-dim);
+    transition: background-color 0.15s ease, color 0.15s ease;
+  }
+  .thread:hover {
+    background: rgb(242 234 217 / 0.07);
+    color: var(--color-parchment);
+  }
+  .thread[aria-current="true"] {
+    background: rgb(91 120 230 / 0.22);
+    color: var(--color-parchment);
+  }
+
+  /* The segment of the ingest stepper that is currently running. Ingest takes
+     minutes, so the one thing the screen owes the reader is proof it is still
+     moving — a static bar and a wedged bar look identical. */
+  .stage-active {
+    background-image: linear-gradient(
+      90deg,
+      rgb(224 138 60 / 0.35) 0%,
+      rgb(224 138 60 / 0.95) 50%,
+      rgb(224 138 60 / 0.35) 100%
+    );
+    background-size: 220% 100%;
+    animation: stage-sweep 1.6s ease-in-out infinite;
+  }
+
+  @keyframes stage-sweep {
+    from {
+      background-position: 130% 0;
+    }
+    to {
+      background-position: -30% 0;
+    }
+  }
+
+  .field {
+    background: rgb(20 17 14 / 0.5);
+    border: 1px solid rgb(242 234 217 / 0.14);
+    border-radius: 0.75rem;
+    color: var(--color-parchment);
+  }
+  .field::placeholder {
+    color: rgb(185 174 155 / 0.55);
+  }
+  .field:focus {
+    outline: none;
+    border-color: rgb(91 120 230 / 0.65);
+    box-shadow: 0 0 0 3px rgb(91 120 230 / 0.18);
+  }
+}
+
+/* Keyboard focus must stay visible everywhere. */
+:focus-visible {
+  outline: 2px solid var(--color-indigo);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  animation: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* The streaming caret. The only ambient motion on the page — it marks the one
+   place where something is genuinely still happening. */
+@keyframes pulse-caret {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.15;
+  }
+}
+
+.caret::after {
+  content: "";
+  display: inline-block;
+  width: 0.5ch;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--color-saffron);
+  animation: pulse-caret 1.1s steps(1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

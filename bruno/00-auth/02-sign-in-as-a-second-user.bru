@@ -1,0 +1,41 @@
+meta {
+  name: Sign in as a second user
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{supabaseUrl}}/auth/v1/token?grant_type=password
+  body: json
+  auth: none
+}
+
+params:query {
+  grant_type: password
+}
+
+headers {
+  apikey: {{anonKey}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "email": "{{email2}}",
+    "password": "{{password}}"
+  }
+}
+
+
+script:post-response {
+  bru.setEnvVar("token2", res.body.access_token);
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  A second identity, used by `06-attempts` (somebody has to sit the paper) and by
+  `07-boundaries` (somebody has to be refused).
+}

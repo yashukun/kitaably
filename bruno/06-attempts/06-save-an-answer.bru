@@ -1,0 +1,36 @@
+meta {
+  name: Save an answer
+  type: http
+  seq: 6
+}
+
+put {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/answers/{{firstQuestionId}}
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+body:json {
+  {
+    "response": "B"
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Autosave. The option key for multiple choice, prose for a written question.
+
+  Refused after the deadline. The browser counts down too, but a client clock is a
+  suggestion and this is the fact — otherwise the answer typed at 90:01 is worth the same
+  as the one typed at 89:59.
+
+  `B` may well be wrong for whichever question generation produced. That is fine and
+  arguably better: it exercises the zero-mark path.
+}

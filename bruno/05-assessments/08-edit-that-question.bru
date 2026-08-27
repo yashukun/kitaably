@@ -1,0 +1,40 @@
+meta {
+  name: Edit that question
+  type: http
+  seq: 8
+}
+
+put {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}/questions/{{handwrittenId}}
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "format": "mcq",
+    "stem": "Which pigment in the chloroplast absorbs the light used in photosynthesis?",
+    "options": [
+      { "key": "A", "text": "Chlorophyll" },
+      { "key": "B", "text": "Haemoglobin" },
+      { "key": "C", "text": "Keratin" },
+      { "key": "D", "text": "Melanin" }
+    ],
+    "correct_option": "A",
+    "points": 1,
+    "difficulty": "recall"
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.origin: eq edited
+}
+
+docs {
+  An edit sets `origin='edited'`, whatever it was before.
+
+  A PUT is a whole question, not a patch, and that is load-bearing here: every column
+  the new format does not use is written back as NULL. Editing a match grid into a
+  true/false must not leave the grid's `answer_key` behind, outranking the new answer.
+}

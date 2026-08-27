@@ -1,0 +1,32 @@
+meta {
+  name: Open a conversation
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/chat/sessions
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "title": null
+  }
+}
+
+
+script:post-response {
+  bru.setEnvVar("chatSessionId", res.body.id);
+}
+
+assert {
+  res.status: eq 201
+}
+
+docs {
+  No scope field. What a conversation can reach is recomputed from the signed-in caller
+  on every question — a scope frozen onto the session at creation would go on answering
+  from material the caller has since lost access to.
+}

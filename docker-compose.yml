@@ -1,0 +1,231 @@
+# Kitaably — the services this repo owns.
+#
+# Postgres, Auth, and Storage are NOT here: they come from the Supabase CLI stack
+# (DECISIONS.md D3). Two commands bring the world up:
+#
+#     supabase start        Postgres + pgvector, Auth, Storage, Studio
+#     docker compose up     backend, worker, beat, embeddings, redis, ollama, frontend
+#
+# Containers reach the CLI stack on the host through host.docker.internal, which is
+# why DATABASE_URL and SUPABASE_URL in .env point there rather than at a service name.
+
+name: kitaably
+
+x-backend-image: &backend-image
+  # ONE image for the API, the workers, and beat — same code, same models, one
+  # build (DEPLOYMENT.md). Without an explicit `image:`, compose tags a separate
+  # image per service (kitaably-backend / -worker / -beat), and rebuilding one
+  # silently leaves the others on stale code.
+  image: kitaably-backend
+  build:
+    context: ./backend
+  env_file: [.env]
+  extra_hosts:
+    # Docker Desktop provides this automatically; the mapping keeps Linux working too.
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    redis:
+      condition: service_healthy
+    embeddings:
+      condition: service_started
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------- broker
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ------------------------------------------------------------ embeddings
+  embeddings:
+    build:
+      context: ./embeddings
+    env_file: [.env]
+    ports: ["8001:8001"]
+    volumes:
+      # Weights and the hub download cache are both under here; keep them across
+      # restarts so a container recreate is not a 130 MB download.
+      - embeddings-cache:/app/.cache
+    healthcheck:
+      # /health, not /ready: this probe answers "is the process alive". The model
+      # takes seconds to load, and a liveness check that failed during that window
+      # would restart the container forever.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- api
+  backend:
+    <<: *backend-image
+    ports: ["8000:8000"]
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./backend/app:/app/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -------------------------------------------------------------- workers
+  # Two workers locally: the llm queue on its own, at concurrency ONE. Ollama
+  # serves one request at a time (OLLAMA_NUM_PARALLEL=1, there is one CPU to
+  # serve with), so two generation tasks in flight do not run in parallel — the
+  # second queues at Ollama while its own 180s request timeout burns, and both
+  # papers come back full of timed-out calls. Observed live: two 10-question
+  # papers generating at once turned minutes of work into failures for both.
+  # In the cluster these are separate Deployments anyway, so a 600-page ingest
+  # cannot starve exam-time aggregation; this mirrors that split at home.
+  worker:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app.celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=2
+      - -Q
+      - ingest,proctor,maintenance
+    volumes:
+      - ./backend/app:/app/app
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  worker-llm:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app.celery_app
+      - worker
+      - --loglevel=info
+      # One at a time is the whole point — see the note above.
+      - --concurrency=1
+      - -Q
+      - llm
+    volumes:
+      - ./backend/app:/app/app
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  beat:
+    <<: *backend-image
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app.celery_app
+      - beat
+      - --loglevel=info
+      # Beat writes a shelve of last-run times. Default is the CWD, which is
+      # root-owned by design, so point it at the image's one writable directory.
+      - --schedule=/app/.state/celerybeat-schedule
+    volumes:
+      - ./backend/app:/app/app
+      - beat-state:/app/.state
+    healthcheck:
+      # Beat does not answer `celery inspect ping` -- it publishes, it does not
+      # consume. What it does do is sync its schedule to disk at least every
+      # max_interval (5 min), so a stale file means beat has wedged. Without this
+      # the container reports Up while the evidence purge quietly stops running.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import pathlib, sys, time
+          f = pathlib.Path("/app/.state/celerybeat-schedule")
+          candidates = [f, *f.parent.glob("celerybeat-schedule*")]
+          fresh = [p for p in candidates if p.exists() and time.time() - p.stat().st_mtime < 900]
+          sys.exit(0 if fresh else 1)
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # -------------------------------------------------------------- local LLM
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    environment:
+      # Keep the weights resident. The default is 5m, after which the next question
+      # pays a cold load off disk before it may start -- measured at 8.2s for an 8B,
+      # which lands entirely on whoever asks the first question after a coffee break.
+      OLLAMA_KEEP_ALIVE: 24h
+      # The context is divided BETWEEN parallel slots, so the default parallelism was
+      # quietly halving it: a 4096 window served as 2048 per request, and the tutor
+      # prompt was silently truncated to fit -- sources dropped, with no error and
+      # nothing in the answer to say half the evidence never arrived. One slot on a
+      # CPU box anyway; there is no second core group to serve a second request with.
+      OLLAMA_NUM_PARALLEL: "1"
+      # Sized to the prompt this app actually builds: system + five ~320-token
+      # sources + six turns of transcript, with room to spare. Bigger is not free --
+      # the KV cache is allocated up front and scanned per token.
+      OLLAMA_CONTEXT_LENGTH: "4096"
+    # Pull the model once the container is up:
+    #     docker compose exec ollama ollama pull llama3.2:3b
+
+  # --------------------------------------------------------------- frontend
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # NEXT_PUBLIC_* is compiled into the browser bundle at build time, so these
+        # are build args rather than runtime environment. Only public values.
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+        NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME}
+    environment:
+      # Server-side only: the target of the /api/backend/:path* rewrite.
+      BACKEND_INTERNAL_URL: http://backend:8000
+      # Also server-side only. The browser reaches Supabase at 127.0.0.1; this
+      # container cannot, so its own calls go through host.docker.internal.
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+    ports: ["3000:3000"]
+    depends_on:
+      - backend
+    healthcheck:
+      # Without this, a container that boots and then 500s on every request still
+      # reports "Up" — which is exactly how a broken frontend hid here once.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  embeddings-cache:
+  beat-state:
+  ollama-models:

@@ -1,0 +1,28 @@
+meta {
+  name: Read the transcript
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api/v1/chat/sessions/{{chatSessionId}}/messages
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("both sides of the exchange were filed", function () {
+    expect(res.getBody().items.length).to.be.at.least(2);
+  });
+}
+
+docs {
+  Question and answer, with the citations stored alongside the answer.
+
+  There is no update or delete on messages for anybody, by design: a transcript that can
+  be edited after the fact is not a transcript.
+}

@@ -1,0 +1,51 @@
+meta {
+  name: Read the draft
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}
+  body: none
+  auth: inherit
+}
+
+
+script:post-response {
+  bru.setEnvVar("questionId", res.body.questions[0].id);
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("every question is traceable to a passage", function () {
+    const questions = res.getBody().questions;
+    expect(questions.length).to.be.at.least(1);
+    questions.forEach((q) => {
+      if (q.origin === "generated") {
+        expect(q.source_chunk_ids.length, `question ${q.index} has no provenance`).to.be.at.least(1);
+      }
+    });
+  });
+}
+
+docs {
+  The author's view: the paper **with its answer key** — `correct_option`, `model_answer`,
+  `rubric` — plus `source_chunk_ids` and `origin`.
+
+  Guarded to the author rather than to anyone who can see the row, because this is the
+  payload that contains the answers. Compare `06-attempts / Open the paper`, which is the
+  same questions with those fields absent.
+
+  `origin` distinguishes `generated` / `edited` / `written`, which is what makes "how
+  much of this paper did the model actually earn" an answerable question.
+
+  `trace` is the generation pipeline trace: steps with timings, one `llm` entry
+  per model call, and a summary (wall clock, model time, calls against budget,
+  per-format acceptance). Content-free by construction — counts and formats,
+  never question text — because a sitter can read the assessments row under RLS
+  and RLS cannot hide a column. Present after the first generation run,
+  including a failed one.
+}

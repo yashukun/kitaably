@@ -1,0 +1,31 @@
+meta {
+  name: Stop sharing
+  type: http
+  seq: 5
+}
+
+patch {
+  url: {{baseUrl}}/api/v1/books/{{bookId}}/scope
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "shared": false
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.scope: eq personal
+}
+
+docs {
+  Unsharing takes the book's chunks out of everyone else's reach on their next query —
+  the chunk rows follow the book by database trigger, in the same transaction. A
+  denormalised scope that lagged behind would be a stale access grant: material the
+  owner believes is private, still answering other people's questions.
+
+  The next request shares it again, because the assessment folder needs canon material.
+}

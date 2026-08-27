@@ -1,0 +1,35 @@
+meta {
+  name: Share with everyone
+  type: http
+  seq: 4
+}
+
+patch {
+  url: {{baseUrl}}/api/v1/books/{{bookId}}/scope
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "shared": true
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.scope: eq canon
+}
+
+docs {
+  Moves the book from `personal` to `canon` — readable by every signed-in user, and the
+  only pool an assessment can draw from.
+
+  The body carries a boolean, not a scope. The client says "share this"; the server
+  decides which enum value that means. A body that named the scope directly would be one
+  refactor away from accepting a value nobody intended, and this is the column the whole
+  privacy model rests on.
+
+  Audited in both directions. This is the only action in the product that changes *who
+  can read something*.
+}

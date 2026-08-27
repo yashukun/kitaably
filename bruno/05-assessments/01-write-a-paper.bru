@@ -1,0 +1,65 @@
+meta {
+  name: Write a paper
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/api/v1/assessments
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "title": "Photosynthesis — end of chapter",
+    "source": {
+      "book_ids": ["{{bookId}}"]
+    },
+    "type": "mixed",
+    "formats": ["mcq", "true_false", "match", "short_answer"],
+    "levels": ["recall", "understand", "evaluate"],
+    "rigor": "medium",
+    "instructions": "Concentrate on the light-independent reactions.",
+    "question_count": 4
+  }
+}
+
+
+script:post-response {
+  bru.setEnvVar("assessmentId", res.body.id);
+}
+
+assert {
+  res.status: eq 202
+  res.body.status: eq generating
+}
+
+docs {
+  202: generation runs on the `llm` queue, never in the request. Poll `Read the draft`
+  for status.
+
+  `book_ids` arrives in a request body, so every id is checked against `scope='canon'`
+  *and* against what the caller may actually read. A book that fails either test refuses
+  the whole request rather than being quietly skipped — an author who asked for four
+  books and got a paper from two has been given something they did not ask for and no
+  way to notice.
+
+  Rate limited to `ASSESSMENT_RATE_LIMIT_PER_HOUR` (10/hour), checked before anything is
+  written: generation is the most expensive thing in the product and refusing it cheaply
+  is the point of checking first.
+
+  **`formats` and `levels` are both optional, and omitting them is a choice rather than
+  a missing answer.** Empty means *auto*: the server picks a mix that suits the coarse
+  `type`, so somebody drafting a quiz from a novel never has to learn what
+  `assertion_reason` means. Send them to be specific; leave them out to be quick.
+
+  `type` on the RESPONSE is derived from the formats rather than echoed back from this
+  request: an author who ticked only `long_answer` has written a subjective paper
+  whatever the dropdown said, and the share link tells a prospective sitter which kind
+  of paper they are opening before they commit to sitting it.
+
+  `instructions` steers emphasis and wording. It is fenced off inside the prompt and
+  cannot loosen the rule that every question comes from the chosen books — an
+  instruction is a brief, not an escape hatch.
+}

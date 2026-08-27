@@ -1,0 +1,52 @@
+meta {
+  name: Sign in
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{supabaseUrl}}/auth/v1/token?grant_type=password
+  body: json
+  auth: none
+}
+
+params:query {
+  grant_type: password
+}
+
+headers {
+  apikey: {{anonKey}}
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "email": "{{email}}",
+    "password": "{{password}}"
+  }
+}
+
+
+script:post-response {
+  bru.setEnvVar("token", res.body.access_token);
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("returns an access token", function () {
+    expect(res.getStatus()).to.equal(200);
+    expect(res.getBody().access_token).to.be.a("string");
+  });
+}
+
+docs {
+  Signs in the first user and stores the token every other request inherits.
+
+  This talks to Supabase Auth directly, not to our API — the backend never issues a
+  token, it only verifies one. Note what the token is worth downstream: exactly the
+  `sub` claim. Role, name and everything else are read from `profiles` on each request,
+  because a Supabase user can rewrite their own `user_metadata` with one call.
+}

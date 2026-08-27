@@ -1,0 +1,26 @@
+meta {
+  name: Delete the book
+  type: http
+  seq: 2
+}
+
+delete {
+  url: {{baseUrl}}/api/v1/books/{{bookId}}
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 202
+}
+
+docs {
+  202, not 204: the storage object, chapters, chunks and the row all go in one Celery
+  task, and the actor is carried across so the audit row names a person rather than the
+  worker that happened to run it.
+
+  One task on purpose — a half-deleted book is worse than either state: chunks whose
+  vectors go on answering questions about material the owner believes is gone.
+
+  This folder runs last because everything above depends on the book existing.
+}

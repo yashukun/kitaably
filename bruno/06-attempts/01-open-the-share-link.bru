@@ -1,0 +1,36 @@
+meta {
+  name: Open the share link
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/exam/{{shareToken}}
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+assert {
+  res.status: eq 200
+  res.body.is_open: eq true
+}
+
+docs {
+  The preview a share link shows before somebody commits to sitting: the paper's name,
+  its shape, whether it is open.
+
+  Deliberately thin. No questions, no author identity, no results — a preview that leaked
+  a stem is a preview somebody screenshots and studies.
+
+  Note the header: this and everything below run as the **second** user. The link is the
+  whole access grant — no roster, no invitation — but the caller still has to be signed
+  in, because a result has to belong to somebody in order to come back to the author.
+
+  Resolved by a SECURITY DEFINER function rather than a policy, because a prospective
+  sitter cannot see the row that starting would let them see: see the code, join the
+  room; join the room, see the code.
+}

@@ -1,0 +1,36 @@
+meta {
+  name: Get a book
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/api/v1/books/{{bookId}}
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq ready
+}
+
+tests {
+  test("ingest finished", function () {
+    const book = res.getBody();
+    expect(book.status, book.error || "no error reported").to.equal("ready");
+    expect(book.owner_is_me).to.equal(true);
+  });
+}
+
+docs {
+  Poll this for ingest status: `uploaded -> parsing -> chunking -> embedding -> ready`.
+
+  A `failed` book carries a sentence in `error` that is fit to show its owner, not a
+  stack trace — and `Retry ingest` puts it back on the queue.
+
+  `owner_is_me` is computed server-side from the caller. The owner's id is deliberately
+  not in the payload: the UI needs one bit to decide whether to offer Share and Delete,
+  and shipping the raw id would hand every reader of the shared library a list of user
+  ids to answer a yes/no question with.
+}

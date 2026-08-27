@@ -1,0 +1,2 @@
+shadcn/ui primitives land here via `npx shadcn@latest add <component>`.
+components.json in the repo root is already pointed at this directory.

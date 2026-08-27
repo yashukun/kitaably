@@ -1,0 +1,21 @@
+meta {
+  name: Metrics
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{baseUrl}}/metrics
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Prometheus text. Grounded refusals are counted separately from errors, because a refusal is correct behaviour and a dashboard that conflates them invites somebody to loosen the threshold.
+
+  Note these are the API process's counters. The Celery worker has its own registry that nothing scrapes yet.
+}

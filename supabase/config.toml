@@ -1,0 +1,122 @@
+# Supabase CLI stack — local development only (DECISIONS.md D3).
+#
+# `supabase start` runs Postgres + pgvector, Auth (GoTrue), Storage, and Studio in
+# their own containers. docker-compose.yml runs only the services this repo owns.
+# Dev then exercises real JWTs, real RLS, and the real Storage API, so auth bugs
+# surface on a laptop instead of in a cluster.
+#
+# Deployed environments point at a hosted project instead; the same SQL migrations
+# apply to both.
+
+project_id = "kitaably"
+
+[api]
+enabled = true
+port = 54321
+# `public` only. The CLI template also lists `graphql_public`, a Supabase-owned schema
+# holding no tables and one function that reports pg_graphql is not installed. Every
+# read and write in this app goes through FastAPI, where the guards and the audit log
+# are -- so exposing a second query surface we would never test or look at is cost
+# without a use.
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 17
+
+[db.pooler]
+enabled = false
+
+[realtime]
+# Nothing subscribes to Postgres changes. Proctoring events are POSTed to FastAPI,
+# which needs to assign severity server-side and never trust the client.
+enabled = false
+
+[studio]
+enabled = true
+port = 54323
+
+[local_smtp]
+# Local mail catcher: confirmation and reset emails land here, not in an inbox.
+enabled = true
+port = 54324
+
+[storage]
+enabled = true
+# Mirrors MAX_UPLOAD_MB in .env.example. Both caps exist: this one stops the bytes
+# arriving, the application one stops the row being written.
+file_size_limit = "80MiB"
+
+[storage.buckets.books]
+public = false
+
+[storage.buckets.evidence]
+public = false
+
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+# Every URL GoTrue is willing to send somebody to after an emailed link. It is an
+# allowlist, not a hint: an origin missing here is refused, which is what stops a
+# crafted `redirectTo` mailing a real recovery token to someone else's site. Keep it
+# exact -- no wildcards, and the deploy overlay adds its own origin rather than
+# loosening this one.
+additional_redirect_urls = ["http://localhost:3000/auth/callback"]
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+enable_signup = true
+
+# The server-side floor. `minLength` on the signup input is an affordance a caller
+# can skip by posting to GoTrue directly, so this is the rule and the form only
+# describes it -- frontend/lib/password.ts holds the number the UI shows and has to
+# agree with this one.
+#
+# 12 with no character-class requirement follows current NIST guidance (SP 800-63B):
+# length carries the entropy, and mandatory symbol classes mostly produce
+# `Passw0rd!` -- which is, not coincidentally, the seed password in seed.sql.
+minimum_password_length = 12
+# `password_requirements` (mandatory character classes) is deliberately left unset.
+# NIST retired that advice because it does not buy entropy -- it buys `Passw0rd!`,
+# the same substitutions every time, and users writing them down. Length is the
+# control that works, so length is the one enforced.
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+# Local only -- Mailpit on :54324 catches everything, and confirming by hand on
+# every test signup is friction with nothing behind it. A hosted project MUST set
+# this true: with it false, anyone can sign up as any address they can spell,
+# including one that already belongs to somebody.
+enable_confirmations = false
+# How long an emailed recovery or confirmation link stays valid. GoTrue's default is
+# 24h, which is a long time for a link that is one click away from a password change
+# and sitting in an inbox.
+otp_expiry = 3600
+
+# Unauthenticated endpoints, so the only thing between them and a script is this.
+# Without a limit, `/recovery` is a free mail cannon pointed at any address a caller
+# can name, and sign-in is unmetered password guessing.
+[auth.rate_limit]
+# Recovery and confirmation mail, per hour, across the whole project.
+email_sent = 10
+# Failed sign-ins per 5 minutes, per IP. Successful ones do not count.
+sign_in_sign_ups = 30
+# Token refreshes per 5 minutes, per IP.
+token_refresh = 150
+# Anonymous sign-ins per hour, per IP.
+anonymous_users = 30
+
+[edge_runtime]
+# Off deliberately. Background work is Celery over Redis (DECISIONS.md D6): named
+# queues, retry budgets, and beat, running as Deployments in our own cluster. Ingest
+# alone runs for minutes on a large PDF and depends on PyMuPDF, so a request-scoped
+# Deno runtime is the wrong shape for it. Turn this on only if a short auth hook or
+# webhook genuinely needs to live next to the database.
+enabled = false
+
+[analytics]
+enabled = false

@@ -1,0 +1,45 @@
+meta {
+  name: Publish it
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}/publish
+  body: none
+  auth: inherit
+}
+
+
+script:post-response {
+  bru.setEnvVar("shareUrl", res.body.share_url);
+  bru.setEnvVar("shareToken", res.body.share_url.split("/").pop());
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq published
+}
+
+tests {
+  test("freezes the marks and mints a link", function () {
+    const paper = res.getBody();
+    expect(paper.max_score).to.be.a("number");
+    expect(paper.share_url).to.be.a("string");
+  });
+}
+
+docs {
+  Freezes `max_score` from the sum of question points and mints a high-entropy share
+  token, which the response returns as a full URL.
+
+  `max_score` is stored rather than summed on read so that voiding a question later
+  cannot silently rescale a paper somebody has already sat.
+
+  The token is minted by the database (`gen_random_bytes`, not `random()` — a seeded PRNG
+  makes tokens predictable from one another). **The URL is a credential**: the response
+  carries it only for the author.
+
+  Refused if any question has no answer to grade against, and refused outright on an
+  empty paper.
+}

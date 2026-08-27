@@ -1,0 +1,26 @@
+meta {
+  name: Gradebook
+  type: http
+  seq: 11
+}
+
+get {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}/attempts
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Every sitting of this paper, with who sat it.
+
+  The name and email come from `public.attempt_sitter`, a SECURITY DEFINER view. A plain
+  join from `attempts` to `profiles` would return **nulls, silently** — the profiles
+  policy admits a user to their own row only, and a join to a table you cannot read gives
+  fewer rows rather than an error.
+
+  Empty until `06-attempts` has run.
+}

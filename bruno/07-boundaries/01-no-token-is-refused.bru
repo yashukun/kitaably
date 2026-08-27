@@ -1,0 +1,20 @@
+meta {
+  name: No token is refused
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/me
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 401
+  res.body.error.code: eq unauthenticated
+}
+
+docs {
+  Every route declares a guard. There is no route that answers without one.
+}

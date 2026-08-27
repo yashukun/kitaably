@@ -1,0 +1,49 @@
+meta {
+  name: Begin the paper
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/v1/exam/{{shareToken}}/start
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+
+script:post-response {
+  bru.setEnvVar("attemptId", res.body.id);
+  bru.setEnvVar("firstQuestionId", res.body.questions[0].id);
+}
+
+assert {
+  res.status: eq 201
+  res.body.status: eq in_progress
+}
+
+tests {
+  test("the sitting payload carries no answer key", function () {
+    const raw = JSON.stringify(res.getBody());
+    expect(raw).to.not.contain("correct_option");
+    expect(raw).to.not.contain("model_answer");
+    expect(raw).to.not.contain("rubric");
+  });
+}
+
+docs {
+  **The test on this request is the most important one in the collection.**
+
+  The questions come from `public.question_sit`, a view that does not *contain*
+  `correct_option`, `model_answer` or `rubric`. Row security cannot hide a column, so a
+  sitter has no policy on `questions` at all and reaches a question only through the
+  view. The absence is the enforcement — a `select *` in a future refactor cannot leak
+  what the view never selected.
+
+  Starting twice resumes rather than erroring: a closed laptop mid-exam must not cost
+  somebody their attempt. `deadline_at` was fixed at the first start, so resuming buys no
+  extra time.
+}

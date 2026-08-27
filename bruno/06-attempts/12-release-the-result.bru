@@ -1,0 +1,24 @@
+meta {
+  name: Release the result
+  type: http
+  seq: 12
+}
+
+post {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/release
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+  res.body.released: eq true
+}
+
+docs {
+  Makes a graded result visible to the person who sat it. A deliberate human act, and
+  audited.
+
+  There is no auto-release and no timer. Already-released attempts return unchanged
+  rather than erroring.
+}

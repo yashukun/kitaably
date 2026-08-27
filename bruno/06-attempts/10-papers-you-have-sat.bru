@@ -1,0 +1,23 @@
+meta {
+  name: Papers you have sat
+  type: http
+  seq: 10
+}
+
+get {
+  url: {{baseUrl}}/api/v1/attempts
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  The sitter's own history. Marks appear only where released.
+}

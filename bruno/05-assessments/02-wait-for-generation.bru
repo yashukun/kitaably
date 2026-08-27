@@ -1,0 +1,42 @@
+meta {
+  name: Wait for generation
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}
+  body: none
+  auth: inherit
+}
+
+script:pre-request {
+  // Generation is batched LLM calls plus validation plus an embedding pass for dedupe.
+  // On CPU-only Ollama that is roughly a minute; on a hosted provider, seconds.
+  await new Promise((resolve) => setTimeout(resolve, 75000));
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("finished, and not with an error", function () {
+    const paper = res.getBody();
+    expect(paper.status, paper.error || "no error reported").to.not.equal("generating");
+    expect(paper.status).to.equal("draft");
+  });
+}
+
+docs {
+  A deliberate 75-second wait, because generation is genuinely slow on CPU. If your model
+  is faster, shorten the pre-request script; if it times out, re-run this request until
+  `status` leaves `generating`.
+
+  **Fewer questions than you asked for is correct, not a failure.** The prompt says to
+  return fewer rather than invent one the passage cannot support, and every question is
+  then validated (self-referential stem, duplicate options, invented provenance) and
+  deduped by stem embedding. A thin source legitimately yields two questions out of four.
+
+  A terminal failure writes a sentence into `error` that is fit to show the author.
+}

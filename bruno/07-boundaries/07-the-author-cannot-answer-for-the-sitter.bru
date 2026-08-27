@@ -1,0 +1,26 @@
+meta {
+  name: The author cannot answer for the sitter
+  type: http
+  seq: 7
+}
+
+put {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/answers/{{firstQuestionId}}
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "response": "A"
+  }
+}
+
+assert {
+  res.status: eq 404
+}
+
+docs {
+  The boundary runs both ways. The author can read an attempt but must never write an
+  answer into one — otherwise "who actually answered this" stops being knowable.
+}

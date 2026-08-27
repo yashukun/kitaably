@@ -1,0 +1,21 @@
+meta {
+  name: Delete that question
+  type: http
+  seq: 9
+}
+
+delete {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}/questions/{{handwrittenId}}
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 204
+}
+
+docs {
+  The remaining questions are renumbered so the paper has no gap in its indices. That
+  happens in two passes with an offset, because `(assessment_id, index)` is unique and
+  renumbering in place collides with the row currently holding the target index.
+}

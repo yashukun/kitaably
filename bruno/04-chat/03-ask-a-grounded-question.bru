@@ -1,0 +1,45 @@
+meta {
+  name: Ask a grounded question
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/api/v1/chat/sessions/{{chatSessionId}}/messages
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "content": "What is photosynthesis?"
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("streams citations, then tokens, then done", function () {
+    const body = res.getBody().toString();
+    expect(body).to.contain("event: citations");
+    expect(body).to.contain("event: done");
+  });
+}
+
+docs {
+  Server-sent events, not JSON: `citations` first so the UI can render the sources it is
+  about to see cited, then `token` repeatedly, then `done`.
+
+  Bruno shows the raw stream rather than rendering it — that is fine, and it is the
+  easiest way to see the frame order.
+
+  Ask something the book does not cover and you get the grounded refusal instead, with
+  an empty citations array and **no LLM call at all**. There is nothing to ground an
+  answer in, so there is nothing to generate.
+
+  Retrieval is capped at `RETRIEVAL_MAX_DISTANCE` (0.35 cosine). Worth knowing: a small
+  document becomes one large chunk whose vector is an average of everything in it, so a
+  narrow question can land just over the line while a broad one sails under.
+}

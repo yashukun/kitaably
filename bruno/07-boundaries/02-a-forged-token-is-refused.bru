@@ -1,0 +1,26 @@
+meta {
+  name: A forged token is refused
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/v1/me
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMTExMTExMS0xMTExLTExMTEtMTExMS0xMTExMTExMTExMTEifQ.not-a-real-signature
+}
+
+assert {
+  res.status: eq 401
+}
+
+docs {
+  The signature is checked against the project's JWKS, and the algorithm comes from the
+  **key**, never from the token's own header. Trusting the header is the classic
+  algorithm-confusion attack: flip `alg` to HS256 and sign with the public key as the
+  shared secret. Pinning to the key's algorithm makes that impossible to express.
+}

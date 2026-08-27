@@ -1,0 +1,30 @@
+meta {
+  name: Who am I
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/api/v1/me
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+  res.body.role: eq user
+}
+
+tests {
+  test("role is read from the database, not the token", function () {
+    expect(res.getBody().role).to.equal("user");
+  });
+}
+
+docs {
+  There is one kind of account, so `role` is always `user` (DECISIONS.md D16).
+
+  The assertion is worth keeping even though it looks trivial: sign up with
+  `{"data": {"role": "admin"}}` and the token really will carry that claim. This endpoint
+  still says `user`, because it reads `profiles`.
+}

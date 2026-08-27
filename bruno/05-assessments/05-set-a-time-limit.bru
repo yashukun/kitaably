@@ -1,0 +1,33 @@
+meta {
+  name: Set a time limit
+  type: http
+  seq: 5
+}
+
+patch {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "duration_minutes": 30,
+    "proctoring_enabled": true
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.duration_minutes: eq 30
+  res.body.proctoring_enabled: eq true
+}
+
+docs {
+  Draft-time edits only. Nothing here can change `status` — publishing is its own route,
+  because it is the act that freezes the paper and mints a token.
+
+  Proctoring is switched on here so `06-attempts` can walk the capture path. It is
+  the author's deliberate choice, off by default — watching people is never a side
+  effect, and the sitter reads a consent screen before anything starts.
+}

@@ -1,0 +1,44 @@
+meta {
+  name: Read the result
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/result
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+script:pre-request {
+  // Marking is one LLM call per written answer, on the `llm` queue.
+  await new Promise((resolve) => setTimeout(resolve, 45000));
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("marked and released", function () {
+    const result = res.getBody();
+    expect(result.graded_at, result.grading_error || "not graded yet").to.not.equal(null);
+    expect(result.released).to.equal(true);
+  });
+}
+
+docs {
+  `released` is explicit in the payload rather than implied by a score being present, so
+  a UI cannot render a mark it was handed for some other reason.
+
+  This paper uses `results_release: immediate`, so grading releases it. Set
+  `on_review` at creation and the marks stay invisible until the author calls
+  `Release the result` — and before that point the answer key is not merely hidden by the
+  API, it is unreadable by that caller under RLS.
+
+  If this fails, re-run it: 45 seconds is a guess at how long CPU-only marking takes.
+}

@@ -1,0 +1,25 @@
+meta {
+  name: Void the attempt
+  type: http
+  seq: 13
+}
+
+post {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/void
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq voided
+}
+
+docs {
+  Invalidates a sitting. A human act, never automatic, always audited.
+
+  A voided attempt is not re-marked — grading it would produce a number somebody could
+  later mistake for a result.
+
+  **Run this last in the folder**: it ends the attempt.
+}

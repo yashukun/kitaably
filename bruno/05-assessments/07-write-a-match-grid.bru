@@ -1,0 +1,69 @@
+meta {
+  name: Write a match grid by hand
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}/questions
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "format": "match",
+    "stem": "Match each chloroplast structure to what happens there.",
+    "prompt_items": [
+      { "key": "1", "text": "Stroma" },
+      { "key": "2", "text": "Thylakoid membrane" },
+      { "key": "3", "text": "Outer membrane" }
+    ],
+    "options": [
+      { "key": "A", "text": "The light-independent reactions" },
+      { "key": "B", "text": "The light-dependent reactions" },
+      { "key": "C", "text": "Separates the organelle from the cytosol" }
+    ],
+    "answer_key": {
+      "pairs": { "1": "A", "2": "B", "3": "C" }
+    },
+    "points": 3,
+    "difficulty": "understand"
+  }
+}
+
+script:post-response {
+  bru.setEnvVar("matchQuestionId", res.body.id);
+}
+
+assert {
+  res.status: eq 201
+  res.body.type: eq match
+  res.body.format: eq match
+  res.body.origin: eq written
+}
+
+docs {
+  The structured half of the format taxonomy, exercised by hand.
+
+  **`type` is not a field.** It is the grading family, and the service derives it from
+  `format` — fourteen formats onto six marking paths. Letting a client send both would
+  allow a question drawn as a match grid and marked as a multiple choice, which scores
+  zero for everybody who sat it while looking completely normal on screen. Postgres
+  holds the same mapping as a check constraint, so a bug here fails the INSERT rather
+  than the exam.
+
+  **The keys you send are not the keys you get back.** The service renumbers the left
+  column onto `1..n` and the right onto `A..H`, and remaps `pairs` in the same pass —
+  models key options `"a"`, `"1"` or repeat one, and renumbering without remapping the
+  answer marks the paper against the wrong letters. Send whatever you like; read the
+  response to find out what it became.
+
+  **`answer_key` never reaches a sitter.** It is one column rather than four
+  (`correct_options`, `accepted`, `pairs`, `order` all live in it) because the rule that
+  matters is that it is ABSENT from `public.question_sit`. One column is one thing to
+  keep out of one view.
+
+  Three pairs, three marks: each independently marked part is worth one, so a sitter who
+  gets two of the three scores two rather than nothing.
+}

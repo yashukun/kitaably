@@ -1,0 +1,19 @@
+meta {
+  name: List your papers
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api/v1/assessments
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Papers you wrote. Papers you have *sat* are under `06-attempts / Papers you have sat`.
+}

@@ -1,0 +1,29 @@
+meta {
+  name: Re-open the paper
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("the saved answer came back", function () {
+    expect(res.getBody().answers.length).to.be.at.least(1);
+  });
+}
+
+docs {
+  What a refresh mid-exam gets: the same questions, plus whatever has been saved so far.
+}

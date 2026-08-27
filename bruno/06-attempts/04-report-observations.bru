@@ -1,0 +1,63 @@
+meta {
+  name: Report observations
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/v1/attempts/{{attemptId}}/proctor-session/events
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{token2}}
+}
+
+script:pre-request {
+  bru.setEnvVar("nowIso", new Date().toISOString());
+}
+
+body:json {
+  {
+    "events": [
+      {
+        "client_ref": "bru-1",
+        "type": "no_face",
+        "occurred_at": "{{nowIso}}",
+        "duration_ms": 42000,
+        "occurrences": 3
+      },
+      {
+        "client_ref": "bru-2",
+        "type": "tab_blur",
+        "occurred_at": "{{nowIso}}",
+        "duration_ms": 134000,
+        "occurrences": 6
+      }
+    ]
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.results[0].accepted: eq true
+}
+
+tests {
+  test("severity is assigned by the server, from the fixed map", function () {
+    const results = res.getBody().results;
+    expect(results[0].severity).to.equal("medium");
+    expect(results[1].severity).to.equal("medium");
+  });
+}
+
+docs {
+  ~10 seconds of debounced observations, as the browser's detector would batch
+  them. Note what the payload cannot say: there is no `severity` field to send —
+  the server assigns it from a fixed map keyed by type, so a client that wants
+  everything to be "info" has no field in which to ask.
+
+  A high-severity event the client holds a still for comes back with a one-shot
+  signed upload URL; the JPEG goes straight to Storage, never through this API.
+}

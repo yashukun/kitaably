@@ -1,0 +1,27 @@
+meta {
+  name: Share again
+  type: http
+  seq: 6
+}
+
+patch {
+  url: {{baseUrl}}/api/v1/books/{{bookId}}/scope
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "shared": true
+  }
+}
+
+assert {
+  res.status: eq 200
+  res.body.scope: eq canon
+}
+
+docs {
+  Puts the book back in the shared library so `05-assessments` has something to draw
+  from. Also demonstrates the toggle is genuinely a toggle rather than a one-way door.
+}

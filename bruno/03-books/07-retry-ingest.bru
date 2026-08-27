@@ -1,0 +1,35 @@
+meta {
+  name: Retry ingest
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{baseUrl}}/api/v1/books/{{bookId}}/retry
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 409
+}
+
+tests {
+  test("refuses a book that did not fail", function () {
+    expect(res.getStatus()).to.equal(409);
+  });
+}
+
+docs {
+  **Expected to return 409 here, and that is the point.**
+
+  Retry only accepts a book in `failed` state. Re-running one that is mid-ingest would
+  put two workers on the same book, and the task is idempotent against a retry of itself
+  — not against a second concurrent run.
+
+  To exercise the 202 path, force a failure first:
+
+  ```sql
+  update public.books set status = 'failed', error = 'forced' where id = '<bookId>';
+  ```
+}

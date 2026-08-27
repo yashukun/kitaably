@@ -1,0 +1,19 @@
+meta {
+  name: Health
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/health
+  body: none
+  auth: none
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Liveness. Answers 200 even with every dependency down — that is the point of it being separate from /ready.
+}

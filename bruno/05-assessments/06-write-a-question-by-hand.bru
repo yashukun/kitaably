@@ -1,0 +1,53 @@
+meta {
+  name: Write a question by hand
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/api/v1/assessments/{{assessmentId}}/questions
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "format": "mcq",
+    "stem": "Which pigment absorbs the light used in photosynthesis?",
+    "options": [
+      { "key": "A", "text": "Chlorophyll" },
+      { "key": "B", "text": "Haemoglobin" },
+      { "key": "C", "text": "Keratin" },
+      { "key": "D", "text": "Melanin" }
+    ],
+    "correct_option": "A",
+    "points": 1,
+    "difficulty": "recall"
+  }
+}
+
+
+script:post-response {
+  bru.setEnvVar("handwrittenId", res.body.id);
+}
+
+assert {
+  res.status: eq 201
+  res.body.origin: eq written
+  res.body.format: eq mcq
+  res.body.type: eq mcq
+}
+
+docs {
+  `origin` is not a field on the request — the service sets it. Letting a client claim
+  `generated` would make the provenance meaningless.
+
+  The same validation a generated question faces applies here — the same function, not
+  a second copy of the rules. Two options that say the same thing, or a `correct_option`
+  that is not among the options, are refused. A human can write an unanswerable question
+  just as easily as a model can, and the consequence is identical.
+
+  `format` is the shape (fourteen of them); `type` in the response is the grading family
+  the service derived from it (six). For a plain multiple choice they happen to share a
+  name. See `Write a match grid by hand` for one where they do not.
+}

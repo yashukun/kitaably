@@ -1,0 +1,23 @@
+meta {
+  name: List books
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/api/v1/books
+  body: none
+  auth: inherit
+}
+
+assert {
+  res.status: eq 200
+}
+
+docs {
+  Your own books plus the shared library. Which rows come back is decided by RLS, not by
+  a filter here.
+
+  Add `?scope=canon` or `?scope=personal` to narrow it. That parameter can only ever
+  *narrow* the set — the policy has already run by the time it applies.
+}
