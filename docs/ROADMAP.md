@@ -20,7 +20,7 @@ unfamiliar work lives.
 
 ---
 
-## Phase 0 — Skeleton and local platform · ~1 week
+## Phase 0 — Skeleton and local platform · ~1 week  ·  **done**
 
 **Ship.** The repository as it stands: folder structure, stub modules, configuration,
 `docker-compose.yml`, and this documentation set. Nothing implements a feature.
