@@ -1,0 +1,94 @@
+# Phase 0's exit gate: lint, typecheck and test on every push and PR. The three
+# service jobs mirror the Makefile's `check` target, so CI and a laptop disagree
+# about nothing. The migrations job is the part a laptop does not do on every run:
+# a throwaway Postgres built from supabase/migrations/ by the CLI, with the
+# model/schema drift test pointed at it afterwards.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run mypy app
+      - run: uv run pytest
+
+  embeddings:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: embeddings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run pytest
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      # next-env.d.ts is generated, not committed; typegen recreates it and the
+      # route types, so tsc sees what a laptop sees after `next dev` has run once.
+      - run: npx next typegen
+      - run: npx tsc --noEmit
+
+  migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The CLI records an empty migration file as applied, leaving schema and
+      # ledger disagreeing — refuse one before anything is applied.
+      - name: refuse empty migrations
+        run: |
+          empty=$(find supabase/migrations -name '*.sql' -empty)
+          if [ -n "$empty" ]; then
+            echo "empty migration files:"
+            echo "$empty"
+            exit 1
+          fi
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.115.0 # the version used locally; bump both together
+      - run: supabase db start
+      - run: supabase db reset # every migration in order, then seed.sql
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+        working-directory: backend
+      - name: models match the migrated schema
+        run: uv run pytest tests/test_db_drift.py -v
+        working-directory: backend
+        env:
+          DRIFT_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:54322/postgres
