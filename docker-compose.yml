@@ -59,8 +59,12 @@ services:
       # /health, not /ready: this probe answers "is the process alive". The model
       # takes seconds to load, and a liveness check that failed during that window
       # would restart the container forever.
+      #
+      # 30s, not 10s: every probe here execs a fresh Python interpreter, and across
+      # this file the probes alone were a steady double-digit CPU spike on an idle
+      # stack. Liveness on a laptop does not need a 10-second answer.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 5
       start_period: 60s
@@ -76,7 +80,7 @@ services:
       - ./backend/app:/app/app
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 5
       start_period: 20s
@@ -104,8 +108,11 @@ services:
     volumes:
       - ./backend/app:/app/app
     healthcheck:
+      # 2 minutes, not 30s: `celery inspect ping` execs a process that imports the
+      # entire app and round-trips the broker — the single most expensive probe in
+      # this file, and it was running twice a minute per worker.
       test: ["CMD", "celery", "-A", "app.workers.celery_app.celery_app", "inspect", "ping"]
-      interval: 30s
+      interval: 120s
       timeout: 10s
       retries: 3
       start_period: 30s
@@ -125,8 +132,9 @@ services:
     volumes:
       - ./backend/app:/app/app
     healthcheck:
+      # Same cost, same reasoning as the worker's probe above.
       test: ["CMD", "celery", "-A", "app.workers.celery_app.celery_app", "inspect", "ping"]
-      interval: 30s
+      interval: 120s
       timeout: 10s
       retries: 3
       start_period: 30s
@@ -173,10 +181,12 @@ services:
       - ollama-models:/root/.ollama
     restart: unless-stopped
     environment:
-      # Keep the weights resident. The default is 5m, after which the next question
-      # pays a cold load off disk before it may start -- measured at 8.2s for an 8B,
-      # which lands entirely on whoever asks the first question after a coffee break.
-      OLLAMA_KEEP_ALIVE: 24h
+      # Long enough that a working session never pays a cold load mid-conversation,
+      # short enough that the weights (~2 GB for the 3B) do not sit resident all
+      # day after one question. The cold load lands on the first question after a
+      # break -- measured at 8.2s for an 8B, a few seconds for the 3B -- and 24h
+      # was measured too: it kept 2 GB pinned on an 11 GB Docker VM overnight.
+      OLLAMA_KEEP_ALIVE: 30m
       # The context is divided BETWEEN parallel slots, so the default parallelism was
       # quietly halving it: a 4096 window served as 2048 per request, and the tutor
       # prompt was silently truncated to fit -- sources dropped, with no error and
@@ -218,7 +228,7 @@ services:
         - node
         - -e
         - "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 5
       start_period: 20s
