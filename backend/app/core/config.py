@@ -200,6 +200,17 @@ class Settings(BaseSettings):
 
     assessment_rate_limit_per_hour: int = 10
 
+    # A `generating` row whose last write is older than this is dead, not slow.
+    # Generation checkpoints its trace onto the row after every stage and every LLM
+    # call, one call is bounded by assessment_llm_timeout_seconds, and the failure
+    # handler writes a reason for any failure it survives to see. What it cannot
+    # survive is the worker being killed mid-run — `docker compose down`, a closed
+    # laptop — which leaves the row generating for ever, refusing every edit and
+    # reporting nothing. The maintenance sweep returns such rows to draft with a
+    # reason. Fifteen minutes is five times the longest silent stretch a live run
+    # can produce.
+    assessment_stale_after_seconds: int = 900
+
     # --- Uploads (untrusted input) -----------------------------------------
     max_upload_mb: int = 80
     max_page_count: int = 1200

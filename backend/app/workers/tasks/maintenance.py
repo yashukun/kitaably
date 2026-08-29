@@ -10,6 +10,13 @@ down rather than read as calm. Every minute it:
   PROCTOR_ABANDON_SECONDS or the attempt's own deadline has passed, then queues
   aggregation — an abandoned attempt still reaches the author's review queue.
 
+sweep_stale_generations is the same idea applied to the generation pipeline: a
+worker killed mid-run gets no chance to run its failure handler, and the row it
+leaves behind shows a spinner for ever while refusing every edit. Staleness is
+read from ``updated_at``, which the touch trigger bumps on every trace
+checkpoint — so "no checkpoint for ASSESSMENT_STALE_AFTER_SECONDS" means dead,
+not slow.
+
 purge_evidence (delete stills past evidence_purge_after) arrives in Phase 11 with
 the rest of operations hardening; the deadline column is already being written by
 aggregate_session so nothing accumulates unbounded meaning in the meantime.
@@ -26,8 +33,13 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import and_, exists, or_, select
 
 from app.core.config import settings
-from app.db.models import Attempt, ProctorEvent, ProctorSession
-from app.db.models.enums import EventType, ProctorSessionStatus, Severity
+from app.db.models import Assessment, Attempt, ProctorEvent, ProctorSession
+from app.db.models.enums import (
+    AssessmentStatus,
+    EventType,
+    ProctorSessionStatus,
+    Severity,
+)
 from app.db.session import WorkerSessionFactory
 from app.services.proctoring import SEVERITY_BY_TYPE
 from app.workers.celery_app import celery_app
@@ -128,3 +140,58 @@ async def _sweep() -> None:
         aggregate_session.delay(str(session_row.id))
     if abandoned:
         logger.info("stale proctor sessions closed", extra={"count": len(abandoned)})
+
+
+# --------------------------------------------------------- stale generations
+
+GENERATION_INTERRUPTED = (
+    "Writing this paper was interrupted before it finished. Generate again."
+)
+
+
+@celery_app.task(bind=True, acks_late=True, queue="maintenance")
+def sweep_stale_generations(self) -> None:
+    asyncio.run(_sweep_generations())
+
+
+def _stale_generations_query(cutoff: datetime):
+    return select(Assessment).where(
+        Assessment.status == AssessmentStatus.GENERATING,
+        Assessment.updated_at < cutoff,
+    )
+
+
+def _release_stale_generation(assessment: Assessment, now: datetime) -> None:
+    """Write what the task's failure handler would have written, had it run."""
+    assessment.status = AssessmentStatus.DRAFT
+    assessment.error = GENERATION_INTERRUPTED
+    trace = assessment.generation_trace
+    if trace is not None and trace.get("finished_at") is None:
+        # The Advanced panel reads a null finished_at as *still running*; stamp the
+        # last checkpoint's time so the trace reads as the record it now is.
+        # Reassigned rather than mutated: a plain JSONB column does not see
+        # in-place changes.
+        stamped = dict(trace)
+        stamped["finished_at"] = (assessment.updated_at or now).isoformat(
+            timespec="seconds"
+        )
+        assessment.generation_trace = stamped
+
+
+async def _sweep_generations() -> None:
+    """Return dead `generating` rows to draft, with a reason the author can act on.
+
+    Racing a run that is merely slow is benign: if the worker is in fact alive and
+    later finishes, its terminal write — full paper or failure reason — lands after
+    this one and wins, and the sweep's cutoff is five times the longest silent
+    stretch a live run can produce anyway.
+    """
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=settings.assessment_stale_after_seconds)
+    async with WorkerSessionFactory() as db:
+        stale = list(await db.scalars(_stale_generations_query(cutoff)))
+        for assessment in stale:
+            _release_stale_generation(assessment, now)
+        if stale:
+            await db.commit()
+            logger.info("stale generations released", extra={"count": len(stale)})

@@ -65,4 +65,12 @@ celery_app.conf.beat_schedule = {
         "task": "app.workers.tasks.maintenance.sweep_stale_sessions",
         "schedule": 60.0,
     },
+    # A worker killed mid-generation leaves its row `generating` for ever with no
+    # error and no way to edit or retry — the failure handler cannot run under
+    # SIGKILL. This returns such rows to draft with a reason. Five minutes: the
+    # staleness threshold is fifteen, so a dead row waits at most twenty.
+    "sweep-stale-generations": {
+        "task": "app.workers.tasks.maintenance.sweep_stale_generations",
+        "schedule": 300.0,
+    },
 }
