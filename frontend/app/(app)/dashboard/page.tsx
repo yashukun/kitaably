@@ -20,9 +20,9 @@ const CARDS = [
   },
   {
     href: "/assessments",
-    eyebrow: "Phases 5–6",
+    eyebrow: "Papers",
     title: "Assessments",
-    body: "Generate a paper from shared chapters, publish it, and share the link. Not built yet.",
+    body: "Draw a paper from your books, publish it, and send the link. Results come back to you to review and release.",
   },
 ] as const;
 
@@ -48,9 +48,9 @@ export default async function DashboardPage() {
       </p>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {CARDS.map((card) => (
-          <Link key={card.href} href={card.href} className="group">
-            <GlassCard className="flex h-full flex-col p-6 transition group-hover:border-parchment/25">
+        {CARDS.map((card, index) => (
+          <Link key={card.href} href={card.href} className="rise block h-full" style={{ animationDelay: `${index * 90}ms` }}>
+            <GlassCard className="lift flex h-full flex-col p-6">
               <Eyebrow>{card.eyebrow}</Eyebrow>
               <p className="mt-2.5 font-display text-xl font-semibold">{card.title}</p>
               <p className="mt-2 text-sm leading-relaxed text-parchment-dim">{card.body}</p>

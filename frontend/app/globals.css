@@ -244,6 +244,50 @@ body::before {
   border-radius: 4px;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
+/* Scroll reveal. The hidden state only exists where a script is guaranteed to be
+   able to clear it — without JS, or under reduced motion, content simply shows. */
+.reveal {
+  transition:
+    opacity 0.7s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@media (scripting: enabled) and (prefers-reduced-motion: no-preference) {
+  .reveal:not([data-shown]) {
+    opacity: 0;
+    transform: translateY(26px) scale(0.985);
+  }
+}
+
+/* Hover lift for cards that are links or hold one. Transform only — layout never
+   moves, so neighbouring cards stay still. */
+.lift {
+  transition:
+    transform 0.35s cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.35s ease,
+    box-shadow 0.35s ease;
+}
+.lift:hover {
+  transform: translateY(-4px);
+  border-color: rgb(242 234 217 / 0.3);
+}
+
+/* Ambient levitation. One element per page, at most. */
+@keyframes levitate {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-10px);
+  }
+}
+.float {
+  animation: levitate 6s ease-in-out infinite alternate;
+}
+
 @keyframes rise {
   from {
     opacity: 0;

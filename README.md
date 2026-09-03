@@ -2,10 +2,10 @@
 
 A study platform built on the books its users actually work from.
 
-You upload the books you are studying from. They stay private to you until you share
-them. Once shared they become (a) a conversational tutor anyone signed in can question,
-and (b) a source for auto-generated assessments, sat under camera-based proctoring, with
-the assessment's author reviewing the report before it reaches the person who sat it.
+You upload the books you are studying from. They become (a) a tutor you can question —
+a private upload answers only to its owner — and (b), once you share them, a source for
+auto-generated assessments, sat under camera-based proctoring, with the assessment's
+author reviewing the report before it reaches the person who sat it.
 
 There is one kind of account. Everyone can upload, share, author an assessment, and sit
 one — see [`docs/DECISIONS.md`](docs/DECISIONS.md) D16 for why roles and classrooms were
@@ -14,9 +14,13 @@ removed, and what that cost.
 Design and rationale live in [`docs/`](docs/); the invariants that must not be traded
 away live in [`CLAUDE.md`](CLAUDE.md).
 
-**Status: Phases 0–6 complete.** Sign-up, sign-in, upload, share, grounded cited chat,
-assessment generation and sitting all work end to end against a live database. Phase 7
-(proctoring) is next; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**Status: Phases 0–6 complete; Phase 7 (proctoring capture) is built in the working
+tree.** Sign-up, sign-in and password recovery, upload, share, grounded cited chat,
+assessment generation and sitting all work end to end against a live database. The
+exam runner now opens a camera session with consent, batches debounced observations
+with heartbeats, uploads evidence stills, and the server scores what it saw; the
+author gets a read-only report beside the marks. Phase 8 — the review gate's
+per-event actions — is next; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 Seeded accounts after `supabase db reset`: `amina@kitaably.test` and
 `ravi@kitaably.test`, password `Passw0rd!123`.
@@ -25,12 +29,14 @@ Seeded accounts after `supabase db reset`: `amina@kitaably.test` and
 
 ## Running it
 
-Two commands, because Supabase runs its own stack (`docs/DECISIONS.md` D3).
+Two stacks, because Supabase runs its own (`docs/DECISIONS.md` D3).
 
 ```bash
 cp .env.example .env       # fill the keys `supabase start` prints
 supabase start             # Postgres+pgvector, Auth, Storage, Studio
 docker compose up --build  # backend, worker, beat, embeddings, redis, ollama, frontend
+supabase db reset          # migrations + seed (the accounts above)
+docker compose exec ollama ollama pull llama3.2:3b   # the dev LLM, once
 ```
 
 | Service | URL |
@@ -83,7 +89,11 @@ worth seeing once.
 │   │   │   ├── chunk.py        chapter detection and chunking
 │   │   │   ├── embed.py        batched calls to the embeddings service
 │   │   │   ├── retrieve.py     ← build_retrieval_filter(): THE scoping chokepoint
-│   │   │   ├── formats.py      14 question formats → 6 grading families
+│   │   │   ├── shape.py        what shape of retrieval a question needs
+│   │   │   ├── rank.py         post-retrieval ranking — pure, and can only discard
+│   │   │   ├── brief.py        turns the author's one-line brief into decisions
+│   │   │   ├── harvest.py      lifts the questions a book already asks
+│   │   │   ├── formats.py      the format registry — one entry since D32
 │   │   │   └── prompts.py      grounding + observation-not-accusation contracts
 │   │   ├── clients/            outbound: embeddings, llm, storage — one file each
 │   │   └── workers/
@@ -102,19 +112,25 @@ worth seeing once.
 │   ├── Dockerfile              weights are NOT baked in — they land in a volume
 │   └── pyproject.toml
 │
-├── frontend/                   Next.js App Router, TypeScript, Tailwind, shadcn/ui
+├── frontend/                   Next.js App Router, TypeScript, Tailwind v4
 │   ├── app/
-│   │   ├── page.tsx            landing
-│   │   ├── (auth)/             /login, /signup
+│   │   ├── page.tsx            landing — the product loop, told step by step
+│   │   ├── (auth)/             /login, /signup, /forgot-password, /reset-password
 │   │   ├── (app)/              dashboard, books, chat, assessments — one shell
-│   │   └── exam/[token]/       the runner — outside the shell, by design
-│   ├── components/             site-nav, book-list, chat-panel, scope-chip, glass
-│   │                           question-input.tsx: one renderer per grading family
+│   │   ├── attempt/[id]/       the runner and its result — outside the shell, by design
+│   │   ├── exam/[token]/       share-link entry; the token grants access to attempt
+│   │   ├── auth/callback/      spends emailed one-shot links server-side (D18)
+│   │   └── api/backend/        the per-request proxy hop to the backend
+│   ├── components/             glass primitives + reveal, site-nav, book-list,
+│   │                           chat-panel, exam-runner, scope-chip —
+│   │                           question-input.tsx: one renderer, keyed by type (D32)
 │   ├── lib/
 │   │   ├── api/                one typed client — no fetch calls in components
+│   │   ├── proctoring/         camera + screen streams and the MediaPipe monitor
 │   │   └── supabase/           browser, server, and session-refresh clients
 │   ├── proxy.ts                refreshes the session cookie on every request
-│   ├── next.config.ts          /api/backend/:path* → backend /api/v1/:path*
+│   ├── next.config.ts          standalone output; proxy body-size headroom — the
+│   │                           backend hop lives in app/api/backend/, per request
 │   └── Dockerfile              standalone output; NEXT_PUBLIC_* are build args
 │
 ├── supabase/                   ← the schema lives here
@@ -163,7 +179,9 @@ Four files carry more weight than their size suggests:
   must pass before any scoping change merges. The one that matters most asserts that
   two users' filters are identical once their ids are masked: there is no account
   whose reach is wider, so there is no account to escalate into.
-- [`backend/app/rag/formats.py`](backend/app/rag/formats.py) — the fourteen question
-  formats and the six grading families they mark through. Postgres holds the same
-  mapping as a check constraint, because a paper drawn as one thing and marked as
-  another scores zero for everybody who sat it while looking completely normal.
+- [`backend/app/rag/formats.py`](backend/app/rag/formats.py) — the registry mapping
+  each question format to the grading family that marks it. One entry since D32 cut
+  fourteen formats to multiple choice alone, but the shape survives on purpose: format
+  and family are checked against each other here and in a Postgres constraint, because
+  a paper drawn as one thing and marked as another scores zero for everybody who sat
+  it while looking completely normal.
