@@ -75,11 +75,13 @@ class QueryProfile:
     never authorizations — resolution happens against the books the principal may
     lawfully see, exactly as ``book_ids`` narrowing always has.
 
-    ``fact`` is set only for METADATA: which column of the record was asked for
-    ("author", "pages", "genre", "title"). The server answers it from the ``books``
-    row it is already holding — asking retrieval, or a model, to find something
-    the process knows for certain would be inventing an opportunity to get it
-    wrong, exactly the argument behind the library reply (D19).
+    ``fact`` is set only for METADATA: which part of the record was asked for —
+    "author", "pages", "genre", "title", or "chapters". The last reads the
+    ``chapters`` table rather than a ``books`` column, but it is the same kind of
+    fact: something this process is already holding, which no passage contains.
+    The server answers from that record — asking retrieval, or a model, to find
+    something the process knows for certain would be inventing an opportunity to
+    get it wrong, exactly the argument behind the library reply (D19).
     """
 
     shape: QueryShape
@@ -176,6 +178,62 @@ _METADATA: tuple[tuple[re.Pattern[str], str], ...] = (
         "title",
     ),
     (re.compile(r"\b(?:name|title) of (?:this|that|the) book\b"), "title"),
+    # --- the book's own table of contents ---------------------------------
+    #
+    # "How many chapters does this book have, and what are they called?" is the
+    # most-asked structural question about a textbook, and it is the one shape a
+    # vector search over passage text can never answer: the chapter list is not
+    # PROSE anywhere in the book, it is `public.chapters`, written at ingest and
+    # sitting in the same transaction the answer is being built in. Measured on
+    # the NCERT Science 10th upload, that question's nearest passage is at cosine
+    # distance 0.43 — the answer key and the copyright page — against a 0.35
+    # ceiling, so it refused about fifteen rows the server was already holding.
+    # Same argument as `author` and `pages` above; chapters were simply missed.
+    #
+    # These must not swallow "which chapters discuss photosynthesis", which is a
+    # LOOKUP: the reader wants the passages, not the outline. The patterns are
+    # written so a topic verb never follows the word, and `classify` re-checks
+    # with `_CHAPTERS_WITH_TOPIC` before trusting the match.
+    (re.compile(r"\bhow many chapters?\b"), "chapters"),
+    (
+        re.compile(
+            r"\b(?:what|which)(?: are| is)? (?:the |its |their )?"
+            r"chapters?(?:[’']s)? (?:names?|titles?)\b"
+        ),
+        "chapters",
+    ),
+    (
+        re.compile(
+            r"\b(?:names?|titles?|list|number) of (?:the |its |all (?:of )?(?:the )?)?chapters?\b"
+        ),
+        "chapters",
+    ),
+    (re.compile(r"\bchapters?(?:[’']s)? (?:names?|titles?|list)\b"), "chapters"),
+    (
+        re.compile(
+            r"\b(?:list|name|show|give|tell)(?: me)? "
+            r"(?:the |all (?:of )?(?:the )?|its )?chapters?\b"
+        ),
+        "chapters",
+    ),
+    (re.compile(r"\btable of contents\b|\bcontents page\b"), "chapters"),
+    (re.compile(r"^toc$"), "chapters"),
+    (
+        re.compile(
+            r"\bwhat chapters?\b(?=.{0,40}\b(?:are (?:there|in)|"
+            r"does (?:it|this|the book) (?:have|contain))\b)"
+        ),
+        "chapters",
+    ),
+)
+
+# "which chapters cover acids" names a subject, so the reader wants the passages
+# that cover it and not the outline. A chapter word followed closely by a topic
+# verb disqualifies the record answer and lets the question fall through to the
+# search paths below.
+_CHAPTERS_WITH_TOPIC = re.compile(
+    r"\bchapters?\b.{0,20}\b(?:discuss|cover|mention|talk about|deal with|explain"
+    r"|contain|describe|introduce|say about|about)\b"
 )
 
 # A captured "title" that is really a demonstrative — "who wrote this book" puts
@@ -323,6 +381,9 @@ def classify(text: str) -> QueryProfile:
         )
 
     record = _metadata_match(cleaned)
+    if record is not None and record[0] == "chapters" and _CHAPTERS_WITH_TOPIC.search(cleaned):
+        # A chapter question with a subject attached is a lookup, not the outline.
+        record = None
     if record is not None:
         fact, named = record
         # A subjectless ask — "who is the author?", "how many pages?" — means the

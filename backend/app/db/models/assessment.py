@@ -85,10 +85,13 @@ class Assessment(Base, UUIDPrimaryKey, Timestamps):
     proctoring_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    # `on_review`: a mark waits for the author to release it. Mirrors the column
+    # default set in 20260902160000 -- the two must agree, or a row inserted by
+    # anything that is not this model gets the other policy silently.
     results_release: Mapped[ResultsRelease] = mapped_column(
         _pg_enum(ResultsRelease, "results_release"),
         nullable=False,
-        server_default=text("'immediate'::public.results_release"),
+        server_default=text("'on_review'::public.results_release"),
     )
 
     opens_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -53,6 +53,9 @@ export type Pipeline = {
   sources: number;
   outcome:
     | "answered"
+    /** The strict search found nothing and the salvage tier did: real passages,
+     *  loose match, and the tutor is told to say so (D31). */
+    | "loose"
     | "book_facts"
     | "refusal"
     | "no_mentions"
@@ -68,11 +71,22 @@ export type ChatSession = {
   last_message_at: string;
 };
 
+/** How a turn ended. The live `Pipeline` carries it too; this is the persisted copy,
+ *  which is the one that survives a reload. */
+export type Outcome = Pipeline["outcome"];
+
+/** The three ways a turn can end with the reader worse off than they hoped, and the
+ *  only ones that offer "the book does cover this". `loose` is included because a
+ *  hedged answer off a weak match is a near miss worth hearing about. */
+export const REPORTABLE: Outcome[] = ["refusal", "no_mentions", "loose"];
+
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
   intent: Intent | null;
+  /** Null on the reader's own rows, and on anything written before it was persisted. */
+  outcome: Outcome | null;
   citations: Citation[];
   created_at: string;
 };
@@ -148,3 +162,28 @@ export function askQuestion(
     options?.signal,
   );
 }
+
+
+/**
+ * Reporting that a grounded refusal was wrong — that the books DO cover it.
+ *
+ * The counter on the server already knows refusals happen. What it cannot know is
+ * which question, over which book, and the person who could actually fix it is the
+ * owner of the material, who otherwise never hears about it.
+ */
+export const reportContentGap = (body: {
+  /** Which surface failed. Chat refusals default; a paper that came back empty
+   *  sends "generation" and an `assessment_id`, and the server attaches that paper's
+   *  generation trace so the report arrives investigable. */
+  source?: "chat" | "generation";
+  message_id?: string | null;
+  assessment_id?: string | null;
+  question: string;
+  book_ids: string[];
+  outcome: string;
+  note?: string | null;
+}) =>
+  api<{ id: string }>("/chat/feedback", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });

@@ -52,10 +52,14 @@ const SIGNALS: Record<
   string,
   { minMs: number; graceMs: number; coalesceMs: number; maxPerMin: number; still?: boolean }
 > = {
-  no_face: { minMs: 3000, graceMs: 1500, coalesceMs: 30_000, maxPerMin: 4 },
+  // `still: true` on everything an author would want to SEE rather than read about.
+  // A line saying "no face for 42s" and a photograph of an empty chair are different
+  // kinds of evidence, and the second is what makes a review defensible. The
+  // per-minute cap below is what stops a camera pointed at a wall uploading hundreds.
+  no_face: { minMs: 3000, graceMs: 1500, coalesceMs: 30_000, maxPerMin: 4, still: true },
   multiple_faces: { minMs: 2000, graceMs: 1500, coalesceMs: 30_000, maxPerMin: 4, still: true },
-  head_pose_away: { minMs: 5000, graceMs: 2000, coalesceMs: 30_000, maxPerMin: 3 },
-  phone_visible: { minMs: 2000, graceMs: 2000, coalesceMs: 30_000, maxPerMin: 3 },
+  head_pose_away: { minMs: 5000, graceMs: 2000, coalesceMs: 30_000, maxPerMin: 3, still: true },
+  phone_visible: { minMs: 2000, graceMs: 2000, coalesceMs: 30_000, maxPerMin: 3, still: true },
   tab_blur: { minMs: 500, graceMs: 0, coalesceMs: 30_000, maxPerMin: 4 },
   window_blur: { minMs: 500, graceMs: 0, coalesceMs: 30_000, maxPerMin: 4 },
   copy: { minMs: 0, graceMs: 0, coalesceMs: 30_000, maxPerMin: 4 },

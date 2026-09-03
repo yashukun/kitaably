@@ -70,6 +70,17 @@ class ChatMessage(Base, UUIDPrimaryKey):
         nullable=True,
     )
 
+    # How the turn ended -- the mirror of `intent`, on the assistant's row instead of
+    # the reader's: answered, loose, refusal, no_mentions, book_facts, pick_book,
+    # needs_two_books, conversational.
+    #
+    # Persisted because the UI has to act on it after a reload. Until this column the
+    # outcome existed only on the ephemeral `pipeline` SSE event, so a refusal read
+    # back from the transcript looked exactly like a good answer -- and the offer to
+    # report a gap vanished the moment somebody refreshed on their way to check the
+    # book. Text and not an enum: nothing in the database dispatches on it.
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # [{chunk_id, book_id, page, scope}] — scope travels with the citation so the UI
     # can label a claim as coming from the shared library or the reader's own upload.
     citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)

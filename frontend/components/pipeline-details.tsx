@@ -27,6 +27,10 @@ const SHAPES: Record<string, string> = {
 
 const OUTCOMES: Record<string, { label: string; tone: string }> = {
   answered: { label: "answered from sources", tone: "text-canon" },
+  // The strict search found nothing and the salvage tier did. Amber rather than
+  // green: the answer is grounded in real passages, but they were a loose match
+  // and the reader should weigh it as one.
+  loose: { label: "answered from loose matches", tone: "text-saffron" },
   book_facts: { label: "answered from the record", tone: "text-canon" },
   refusal: { label: "grounded refusal", tone: "text-saffron" },
   no_mentions: { label: "no mention found", tone: "text-saffron" },
@@ -140,7 +144,7 @@ export function PipelineDetails({
               </p>
             )}
             <p className="mt-0.5">
-              {pipeline.outcome === "answered" ? (
+              {pipeline.outcome === "answered" || pipeline.outcome === "loose" ? (
                 <>
                   {pipeline.sources} source{pipeline.sources === 1 ? "" : "s"} → tutor ·{" "}
                   {streaming

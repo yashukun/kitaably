@@ -197,3 +197,123 @@ def test_a_damaged_part_is_named_not_skipped() -> None:
     data = _zip({"ch1.pdf": b"%PDF-1.4 but nothing a reader could open"})
     with pytest.raises(parse.UnparseableDocument, match="ch1.pdf"):
         parse.parse(data, SourceFormat.ZIP)
+
+
+# --- chapter titles ----------------------------------------------------------
+#
+# A zip of per-chapter PDFs with no outlines took its titles from the member
+# FILENAMES, and NCERT-style downloads are named jesc101.pdf. Fifteen chapters
+# called "jesc101 … jesc113" is a table of contents nobody can read — and it is
+# what the author picks from when scoping an assessment to a chapter.
+
+
+def test_a_part_is_titled_from_its_opening_page_not_its_filename() -> None:
+    """The heading NCERT-style school texts set: title, number, then CHAPTER."""
+    data = _zip(
+        {
+            "jesc101.pdf": _pdf(
+                ["Chemical Reactions and Equations 1 CHAPTER Consider the following"]
+            ),
+            "jesc102.pdf": _pdf(
+                ["Acids, Bases and Salts 2 CHAPTER You have learnt in your previous"]
+            ),
+        }
+    )
+    pages = parse.parse(data, SourceFormat.ZIP)
+    chapters = chunker.detect_chapters(pages, data, SourceFormat.ZIP)
+
+    assert [chapter.title for chapter in chapters] == [
+        "Chemical Reactions and Equations",
+        "Acids, Bases and Salts",
+    ]
+
+
+def test_a_running_head_is_stripped_from_a_recovered_title() -> None:
+    """Textbooks print "Science 58" in front of the opener on the same line."""
+    data = _zip(
+        {
+            "a.pdf": _pdf(["Science 58 Carbon and its Compounds 4 CHAPTER In the last"]),
+            "b.pdf": _pdf(["Life Processes 5 CHAPTER How do we tell the difference"]),
+        }
+    )
+    pages = parse.parse(data, SourceFormat.ZIP)
+    chapters = chunker.detect_chapters(pages, data, SourceFormat.ZIP)
+
+    assert [chapter.title for chapter in chapters] == [
+        "Carbon and its Compounds",
+        "Life Processes",
+    ]
+
+
+def test_an_unrecognised_opening_page_keeps_the_filename() -> None:
+    """The fallback is where this started, so failing to recognise a heading costs
+    nothing. Front matter and answer keys are exactly the parts that have none."""
+    data = _zip(
+        {
+            "jesc1an.pdf": _pdf(["Answers Chapter 1 1. (i) 2. (d) 3. (a) Chapter 2"]),
+            "jesc1ps.pdf": _pdf(["SCIENCE TEXTBOOK FOR CLASS X Reprint 2026-27"]),
+        }
+    )
+    pages = parse.parse(data, SourceFormat.ZIP)
+    chapters = chunker.detect_chapters(pages, data, SourceFormat.ZIP)
+
+    assert [chapter.title for chapter in chapters] == ["jesc1an", "jesc1ps"]
+
+
+def test_recovering_a_title_never_moves_a_boundary() -> None:
+    """Only the label changes. The seams are still the uploaded files, which is
+    what keeps a chunk from ever spanning two of them."""
+    members = {
+        "one.pdf": _pdf(["Chemical Reactions and Equations 1 CHAPTER text", "more one"]),
+        "two.pdf": _pdf(["Acids, Bases and Salts 2 CHAPTER text"]),
+    }
+    data = _zip(members)
+    pages = parse.parse(data, SourceFormat.ZIP)
+    chapters = chunker.detect_chapters(pages, data, SourceFormat.ZIP)
+
+    assert [(c.page_start, c.page_end) for c in chapters] == [(1, 2), (3, 3)]
+
+
+def test_a_part_with_its_own_outline_still_wins() -> None:
+    """A part naming two or more chapters keeps them; page-head recovery is only
+    ever the fallback for a part that named none."""
+    data = _zip(
+        {
+            "half.pdf": _pdf(
+                ["Something Else 9 CHAPTER opening", "second", "third"],
+                toc=[[1, "Real Chapter One", 1], [1, "Real Chapter Two", 3]],
+            )
+        }
+    )
+    pages = parse.parse(data, SourceFormat.ZIP)
+    chapters = chunker.detect_chapters(pages, data, SourceFormat.ZIP)
+
+    assert [chapter.title for chapter in chapters] == [
+        "Real Chapter One",
+        "Real Chapter Two",
+    ]
+
+
+def test_page_furniture_in_front_of_the_heading_is_shed() -> None:
+    """PDF text order does not match reading order.
+
+    The real page for one chapter extracts as "Science 208 Activity 13.1 …
+    Our Environment 13 CHAPTER" — a running head and five figure labels ahead of
+    the title. The walk-back from the anchor has to stop at the title rather than
+    swallowing the furniture, which is what the numeric-token rule is for.
+    """
+    data = _zip(
+        {
+            "a.pdf": _pdf(
+                [
+                    "Science 208 Activity 13.1 Activity 13.1 Activity 13.1 "
+                    "Our Environment 13 CHAPTER We have heard the word environment"
+                ]
+            ),
+            "b.pdf": _pdf(["Electricity 12 CHAPTER Electricity has an important place"]),
+        }
+    )
+    pages = parse.parse(data, SourceFormat.ZIP)
+    chapters = chunker.detect_chapters(pages, data, SourceFormat.ZIP)
+
+    assert [chapter.title for chapter in chapters] == ["Our Environment", "Electricity"]

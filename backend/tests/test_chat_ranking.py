@@ -268,3 +268,76 @@ def test_fuse_never_admits() -> None:
 
     admitted = {row["chunk_id"] for row in fuse(lexical, vector)}
     assert admitted == {row["chunk_id"] for row in lexical + vector}
+
+
+# --- the same passage in two books ------------------------------------------
+
+
+def test_an_identical_passage_in_two_books_collapses() -> None:
+    """The same book uploaded twice must not fill the source budget twice.
+
+    Observed live: two copies of one 232-page science text returned every
+    passage at an identical distance, so a five-source answer saw two or three
+    distinct passages and the dominance vote split 50/50 between the copies.
+    """
+    shared = "Sodium reacts vigorously with water to form sodium hydroxide. " * 6
+    kept = dedupe([hit(CHEM, 12, 0.11, shared), hit(BIO, 40, 0.11, shared)])
+
+    assert len(kept) == 1
+    # The strongest instance survives, so the citation still points at the top hit.
+    assert kept[0]["book_id"] == CHEM
+
+
+def test_different_passages_in_two_books_both_survive() -> None:
+    """Collapsing is about identical text, never about two books agreeing."""
+    kept = dedupe(
+        [
+            hit(CHEM, 12, 0.11, "Sodium reacts vigorously with water. " * 8),
+            hit(BIO, 40, 0.12, "Photosynthesis converts light into chemical energy. " * 8),
+        ]
+    )
+    assert len(kept) == 2
+
+
+def test_collapsing_a_duplicate_lets_one_book_win_the_vote() -> None:
+    """The point of the collapse: routing can fire again.
+
+    With the duplicate kept, each copy scored half the evidence and no book
+    cleared the dominance threshold, so `route` kept both and spent the budget
+    showing the reader the same pages twice.
+    """
+    shared = "Sodium reacts vigorously with water to form sodium hydroxide. " * 6
+    hits = [
+        hit(CHEM, 12, 0.11, shared),
+        hit(BIO, 40, 0.11, shared),
+        hit(CHEM, 13, 0.14, "Potassium is even more reactive than sodium. " * 8),
+        hit(CHEM, 14, 0.16, "Calcium reacts less vigorously with cold water. " * 8),
+    ]
+    votes = vote(dedupe(hits))
+    assert votes[0].book_id == CHEM
+    assert votes[0].share > 0.9
+
+
+def test_a_hit_with_no_distance_still_votes() -> None:
+    """Lexical hits carry a ts_rank, not a cosine distance.
+
+    The focused path fuses them in from the salvage tier, and `vote` used to call
+    `float(None)` on the first one — a crash on the exact path that exists to
+    rescue a question that would otherwise have been refused.
+    """
+    hits = [hit(CHEM, 12, None), hit(CHEM, 13, 0.2), hit(BIO, 40, None)]
+    votes = vote(hits)
+
+    assert {v.book_id for v in votes} == {CHEM, BIO}
+    assert all(v.share > 0 for v in votes)
+    # Chemistry supplied two passages to Biology's one, so it leads.
+    assert votes[0].book_id == CHEM
+
+
+def test_narrow_survives_a_fused_lexical_hit() -> None:
+    """The whole pipeline, on the shape the salvage tier actually produces."""
+    hits = [hit(CHEM, 12, None), hit(CHEM, 13, 0.2), hit(CHEM, 14, 0.3)]
+    kept, votes = narrow(hits, limit=2)
+
+    assert len(kept) == 2
+    assert votes[0].book_id == CHEM

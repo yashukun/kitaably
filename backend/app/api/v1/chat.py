@@ -5,6 +5,7 @@
     GET   /chat/sessions/{session_id}/messages    require_auth
     GET   /chat/sessions/{session_id}/export      require_auth  -> file download
     POST  /chat/sessions/{session_id}/messages    require_auth  -> SSE stream
+    POST  /chat/feedback                          require_auth  -> a reported gap
 
 Every route declares a guard. Ownership of a conversation is enforced by RLS: a
 session that is not yours is not visible, so it reads as absent rather than
@@ -36,11 +37,14 @@ from app.schemas.chat import (
     ChatExportFormat,
     ChatSessionCreate,
     ChatSessionRead,
+    ContentFeedbackCreate,
+    ContentFeedbackRead,
     MessageCreate,
     MessageRead,
 )
 from app.schemas.common import Page
 from app.services import chat as service
+from app.services import suggestions
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +95,49 @@ async def list_chat_sessions(
 ) -> Page[ChatSessionRead]:
     rows = await service.list_sessions(session, principal)
     return Page(items=[ChatSessionRead.model_validate(row) for row in rows])
+
+
+# Declared before the parameterised session routes for the same reason the
+# assessments suggestions route is: FastAPI matches in declaration order, and
+# "feedback" must not be read as a session id.
+@router.post("/chat/feedback", status_code=201)
+async def report_content_gap(
+    data: ContentFeedbackCreate,
+    principal: Principal = Depends(require_auth),
+    session: AsyncSession = Depends(get_session),
+) -> ContentFeedbackRead:
+    """Somebody answering a failure: a refusal that was wrong, or a paper that came
+    back empty.
+
+    One route for both surfaces rather than two, because what is being recorded is the
+    same thing — "this did not work, here is what the app knew" — and splitting it
+    would mean two tables to read before anybody could see whether a book has a
+    problem.
+
+    Rate limited on the same bucket as messages — it is reachable from every refused
+    turn, and the cost of a runaway client is a table nobody can read through.
+    """
+    try:
+        await ratelimit.check(
+            f"chat:{principal.id}", limit=settings.chat_rate_limit_per_minute
+        )
+    except RateLimited:
+        chat_rate_limited_total.inc()
+        raise
+
+    row = await suggestions.record_gap(
+        session,
+        principal,
+        source=data.source,
+        message_id=data.message_id,
+        assessment_id=data.assessment_id,
+        question=data.question,
+        book_ids=data.book_ids,
+        outcome=data.outcome,
+        note=data.note,
+    )
+    await session.commit()
+    return ContentFeedbackRead.model_validate(row)
 
 
 @router.get("/chat/sessions/{session_id}/messages")
@@ -195,6 +242,10 @@ async def send_message(
         # machinery.
         if turn.trace is not None:
             yield _sse("pipeline", {"pipeline": turn.trace})
+        # The one part of the trace that IS persisted, on the message row. The rest is
+        # machinery; this is how the turn ended, and the UI has to still know it after
+        # a reload to offer a refusal the chance to be reported.
+        outcome = (turn.trace or {}).get("outcome")
         # Then citations: the sources can be drawn while the answer is still arriving.
         yield _sse("citations", {"citations": citations})
 
@@ -220,7 +271,10 @@ async def send_message(
                 return
 
             await service.record_answer(
-                chat_session_id=chat_id, content="".join(answer), citations=citations
+                chat_session_id=chat_id,
+                content="".join(answer),
+                citations=citations,
+                outcome=outcome,
             )
             filed = True
             yield _sse(
@@ -244,6 +298,7 @@ async def send_message(
                         chat_session_id=chat_id,
                         content="".join(answer),
                         citations=citations,
+                        outcome=outcome,
                     )
                 )
 

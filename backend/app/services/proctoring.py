@@ -109,19 +109,47 @@ SCORE_WEIGHTS: dict[EventType, tuple[float, float]] = {
     EventType.MULTIPLE_DISPLAYS: (6.0, 4.0),
 }
 
-# One event, however long or repeated, cannot dominate the whole score. A single
-# four-hour no_face (a camera pointed at a wall) reads the same as a very eventful
-# session would anyway — and everything past the cap is visible in the timeline.
-_PER_EVENT_CAP = 25.0
+# One event cannot take the score below this much on its own. Raised from 25 when
+# scoring became proportional, because the old ceiling was written for absolute
+# durations and quietly became the binding constraint: a camera that saw nobody for a
+# whole sitting earned 63 points of penalty and had 38 of them thrown away by the cap,
+# scoring 75 — still far too generous for "nobody was there".
+#
+# It exists at all so that ONE noisy detector cannot alone produce a zero: a flaky
+# webcam that reports no_face all session is a hardware story as often as a human one,
+# and the timeline is what the author reads to tell them apart.
+_PER_EVENT_CAP = 70.0
+
+# What a condition that held for the WHOLE sitting costs, at weight 1.0. Ten, so a
+# `no_face` (weight 6.0) lasting the entire sitting is 60 points — a failing score for
+# a camera that never saw anybody, which is the case that used to score 96.
+_FULL_SITTING_SCALE = 10.0
 
 
 def compute_integrity_score(
-    events: list[ProctorEvent], *, include_dismissed: bool = True
+    events: list[ProctorEvent],
+    *,
+    include_dismissed: bool = True,
+    sitting_seconds: float | None = None,
 ) -> int:
-    """100 − Σ (weight[type] × f(duration, occurrences)), clamped to [0, 100].
+    """100 − Σ penalties, clamped to [0, 100]. Pure, so the arithmetic is testable.
 
-    Pure, so the arithmetic is testable without a database. Called with
-    ``include_dismissed=False`` after author verdicts (Phase 8): a dismissed
+    **Duration is scored as a SHARE of the sitting, not as raw seconds**, and that is
+    the whole correction. The absolute version was wrong in a way that only showed up
+    at the extremes: a sitter absent for 11.5 seconds of a 13-second sitting — gone
+    for ninety percent of it — scored 96/100, because 11.5s is 0.19 minutes and
+    0.19 × 6.0 is 1.2 points. The same absence in a 60-minute exam genuinely IS minor.
+    The number that carries the meaning is the proportion, and it is the one a
+    reviewer means when they ask whether somebody was present.
+
+    Instant events keep their per-occurrence weight: a paste has no duration, and
+    "how much of the sitting was a paste" is not a question.
+
+    ``sitting_seconds`` is the wall clock of the session. Without it the old absolute
+    behaviour is used, so a caller that cannot supply it degrades rather than divides
+    by zero — but every caller in this codebase supplies it.
+
+    Called with ``include_dismissed=False`` after author verdicts: a dismissed
     observation is excluded from any released score as well as any released report.
     """
     penalty = 0.0
@@ -129,8 +157,20 @@ def compute_integrity_score(
         if not include_dismissed and event.author_verdict is AuthorVerdict.DISMISSED:
             continue
         per_occurrence, per_minute = SCORE_WEIGHTS[event.type]
-        minutes = (event.duration_ms or 0) / 60_000
-        contribution = per_occurrence * event.occurrences + per_minute * minutes
+        duration_ms = event.duration_ms or 0
+
+        if sitting_seconds and sitting_seconds > 0 and duration_ms:
+            # The share of the sitting this condition held, scaled by the same weight
+            # the per-minute figure carried. `_FULL_SITTING_SCALE` is what a condition
+            # true for the ENTIRE sitting costs at weight 1.0 — so no_face (6.0) held
+            # throughout is 60 points before the cap, which is a failing score and
+            # should be.
+            share = min(1.0, (duration_ms / 1000) / sitting_seconds)
+            duration_penalty = per_minute * share * _FULL_SITTING_SCALE
+        else:
+            duration_penalty = per_minute * (duration_ms / 60_000)
+
+        contribution = per_occurrence * event.occurrences + duration_penalty
         penalty += min(contribution, _PER_EVENT_CAP)
     return max(0, min(100, round(100 - penalty)))
 
@@ -297,6 +337,11 @@ def observation_summary(events: list[ProctorEvent]) -> list[dict[str, Any]]:
                 "occurred_at": event.occurred_at,
                 "severity": event.severity,
                 "text": " ".join(parts),
+                # The object path, not a URL. Signing happens in the author-guarded
+                # caller, so a summary can be built anywhere without minting a link to
+                # a photograph of somebody as a side effect.
+                "evidence_path": event.evidence_path,
+                "verdict": event.author_verdict,
             }
         )
     return lines

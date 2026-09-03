@@ -3,6 +3,7 @@
     POST   /books                     require_auth        -> always personal, 202
     GET    /books                     require_auth        (?scope=canon|personal)
     GET    /books/{book_id}           require_auth        (poll for status)
+    GET    /books/{book_id}/suggestions require_auth       (what to ask about it)
     PATCH  /books/{book_id}/scope     require_book_owner  -> share/unshare, audit_log
     POST   /books/{book_id}/retry     require_book_owner  -> 202
     DELETE /books/{book_id}           require_book_owner  -> 202, audit_log
@@ -21,6 +22,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import ratelimit
+from app.core.config import settings
 from app.core.deps import require_auth, require_book_owner
 from app.core.security import Principal
 from app.db.models.enums import BookScope
@@ -28,6 +31,7 @@ from app.db.session import get_session
 from app.schemas.book import BookAccepted, BookRead, BookScopeUpdate
 from app.schemas.common import Page
 from app.services import books as service
+from app.services import suggestions
 
 router = APIRouter(tags=["books"])
 
@@ -148,6 +152,29 @@ async def get_book(
 ) -> BookRead:
     """Poll this for ingest status. `failed` carries a user-facing `error`."""
     return _to_read(await service.get_book(session, principal, book_id), principal)
+
+
+@router.get("/books/{book_id}/suggestions")
+async def book_suggestions(
+    book_id: UUID,
+    principal: Principal = Depends(require_auth),
+    session: AsyncSession = Depends(get_session),
+) -> list[str]:
+    """Questions worth asking about this book. May be empty, and that is an answer.
+
+    `require_auth` rather than `require_book_owner`: a shared book is readable by
+    everybody who did not upload it, and an ownership guard would refuse exactly the
+    library this exists to open up. Visibility is RLS's job, as it is on GET
+    /books/{book_id} — an invisible book and an absent one give the same empty result.
+    The chunk query underneath still carries `build_retrieval_filter` explicitly;
+    RLS is the second line here, never the first.
+
+    Rate limited because it is reachable from a picker somebody can click repeatedly.
+    """
+    await ratelimit.check(
+        f"suggest:{principal.id}", limit=settings.chat_rate_limit_per_minute
+    )
+    return await suggestions.questions_for_book(session, principal, book_id)
 
 
 @router.patch("/books/{book_id}/scope")

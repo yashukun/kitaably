@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -33,6 +34,7 @@ from app.core.security import Principal
 from app.db.models import Assessment, Attempt, Book, Chunk, Question
 from app.db.models.enums import (
     AssessmentStatus,
+    AssessmentType,
     BookScope,
     Difficulty,
     QuestionFormat,
@@ -40,8 +42,9 @@ from app.db.models.enums import (
     QuestionType,
     Role,
 )
-from app.rag import formats, prompts
-from app.rag.retrieve import fetch_generation_chunks
+from app.rag import brief as brief_reader
+from app.rag import formats, harvest, prompts
+from app.rag.retrieve import fetch_generation_chunks, fetch_topic_chunks
 from app.schemas.assessment import AssessmentCreate, AssessmentUpdate, QuestionWrite
 from app.schemas.attempt import GeneratedQuestion
 from app.services import audit
@@ -58,12 +61,10 @@ _SELF_REFERENCE = re.compile(
 
 _BANNED_OPTIONS = {"all of the above", "none of the above", "both a and b", "all of these"}
 
-# Canonical keys, assigned by us and never by the model. Eight, because a match grid
-# and a select-all can both run past D.
+# Canonical keys, assigned by us and never by the model. Eight rather than five: the
+# bound belongs to the key alphabet, and a spec's max_options is what actually limits a
+# question, so widening one later does not mean remembering to widen the other.
 _OPTION_KEYS = "ABCDEFGH"
-# Match grids number their left-hand column rather than lettering it, so the two sides
-# of the grid cannot be confused for each other on screen or in a stored answer.
-_ITEM_KEYS = "12345678"
 
 
 # ============================================================ authoring
@@ -114,20 +115,19 @@ async def create_draft(
             "shared. One or more of the books you chose is neither, or no longer exists."
         )
 
-    # An empty formats list means *auto*, not "none": resolve it here rather than at
-    # generation time so the row records what will actually be written, and the author
-    # can see it on the paper while it is still being drafted.
-    chosen_formats = formats.resolve_formats(data.formats, assessment_type=data.type)
+    # Recorded on the row rather than assumed at generation time, so the paper says what
+    # it will be written as while it is still a draft.
+    chosen_formats = formats.resolve_formats()
     chosen_levels = formats.resolve_levels(data.levels)
 
     assessment = Assessment(
         author_id=principal.id,
         title=data.title.strip(),
-        # Derived from the formats rather than trusted from the client. An author who
-        # ticked only `long_answer` has written a subjective paper whatever the
-        # dropdown said, and the share-link preview tells a prospective sitter which
-        # kind of paper they are about to open.
-        type=formats.derive_type(chosen_formats),
+        # Not trusted from the client, and no longer derived either: every paper is
+        # multiple choice since D32. The column keeps its wider enum because older rows
+        # legitimately record a paper that WAS mixed, and rewriting that to tidy the
+        # type would be rewriting history.
+        type=AssessmentType.MCQ,
         rigor=data.rigor,
         source_selection={
             "book_ids": [str(book_id) for book_id in data.source.book_ids],
@@ -142,10 +142,10 @@ async def create_draft(
             "formats": [fmt.value for fmt in chosen_formats],
             "levels": [level.value for level in chosen_levels],
             "instructions": (data.instructions or "").strip() or None,
-            # Whether the author picked or skipped. Worth keeping: "the model chose
-            # these formats" and "the author chose these formats" are different
+            # Whether the author named the levels or skipped them. Worth keeping: "the
+            # server chose this spread" and "the author chose this spread" are different
             # answers to the same complaint about a paper.
-            "auto": not data.formats,
+            "auto": not data.levels,
         },
         question_count=data.question_count,
         duration_minutes=data.duration_minutes,
@@ -261,9 +261,8 @@ def _canonical_choices(
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
     """Renumber a choice list onto our keys. Returns the list and old -> new.
 
-    Ours, never the model's: `_OPTION_KEYS` for anything picked and `_ITEM_KEYS` for
-    the left column of a match grid, so the two sides of a grid can never be confused
-    for one another on screen or in a stored answer.
+    Ours, never the model's. A model that returns options keyed "1"/"2", or keyed
+    "B"/"A" in that order, must not be able to decide what a stored answer means.
     """
     canonical: list[dict[str, str]] = []
     remap: dict[str, str] = {}
@@ -308,22 +307,14 @@ def build_question_fields(
     *,
     stem: str,
     options: list[dict[str, str]] | None = None,
-    prompt_items: list[dict[str, str]] | None = None,
     correct_option: str | None = None,
-    correct_options: list[str] | None = None,
-    accepted: list[str] | None = None,
-    tolerance: float | None = None,
-    pairs: dict[str, str] | None = None,
-    order: list[str] | None = None,
-    model_answer: str | None = None,
-    rubric: list[dict[str, Any]] | None = None,
     points: Decimal | None = None,
 ) -> dict[str, Any]:
     """Canonicalise one question into columns, or raise ``ValidationFailed`` saying why.
 
-    The returned dict is exactly the column set: every field a format does not use is
-    explicitly ``None`` rather than left off, so a question edited from a match grid
-    into a true/false does not keep a stale `answer_key` that outranks its new answer.
+    The returned dict is exactly the column set: the columns this format does not use
+    are explicitly ``None`` rather than left off, so a question edited in place cannot
+    keep a stale `answer_key` or `model_answer` written before D32.
     """
     spec = formats.SPECS[fmt]
     stem = (stem or "").strip()
@@ -351,14 +342,6 @@ def build_question_fields(
     if spec.min_options:
         _require_usable_keys(options, "options")
         chosen, remap = _canonical_choices(options, _OPTION_KEYS)
-        if spec.fixed_options:
-            # True/false and yes/no do not get to invent their options. Rebuild them
-            # in a fixed order and work out which key the given answer meant, so a
-            # model that returned False first does not invert the whole paper.
-            chosen, correct_option = _rebuild_fixed(
-                chosen, remap, spec.fixed_options, correct_option
-            )
-            remap = {option["key"]: option["key"] for option in chosen}
         if not (spec.min_options <= len(chosen) <= spec.max_options):
             raise ValidationFailed(
                 f"A {spec.label.lower()} needs between {spec.min_options} and "
@@ -375,115 +358,16 @@ def build_question_fields(
     elif options:
         raise ValidationFailed(f"A {spec.label.lower()} does not have options.")
 
-    # ------------------------------------------------------ family by family
-    family = spec.family
-
-    if family is QuestionType.MCQ:
-        key = _remapped(correct_option, remap)
-        if key is None:
-            raise ValidationFailed("The correct answer must be one of the options.")
-        fields["correct_option"] = key
-
-    elif family is QuestionType.MULTI_SELECT:
-        keys = [k for k in (_remapped(c, remap) for c in correct_options or []) if k]
-        keys = list(dict.fromkeys(keys))
-        if len(keys) < 2:
-            raise ValidationFailed(
-                "A select-all question needs at least two correct options — with one, "
-                "it is an ordinary multiple choice and should be written as one."
-            )
-        if len(keys) >= len(fields["options"]):
-            raise ValidationFailed("Every option cannot be correct.")
-        fields["answer_key"] = {"correct_options": keys}
-
-    elif family is QuestionType.MATCH:
-        _require_usable_keys(prompt_items, "items")
-        left, left_remap = _canonical_choices(prompt_items, _ITEM_KEYS)
-        if len(left) < 3:
-            raise ValidationFailed("A match grid needs at least three items to match.")
-        if not _distinct_texts(left):
-            raise ValidationFailed("Two items on the left are duplicates.")
-        mapped = {}
-        for old_left, old_right in (pairs or {}).items():
-            new_left = left_remap.get(str(old_left).strip().upper())
-            new_right = _remapped(old_right, remap)
-            if new_left and new_right:
-                mapped[new_left] = new_right
-        if len(mapped) != len(left):
-            raise ValidationFailed("Every item on the left needs exactly one match.")
-        if len(left) == len(fields["options"]) and len(set(mapped.values())) != len(mapped):
-            # Equal columns means a one-to-one grid. Two lefts sharing a right leaves
-            # a right-hand item that pairs with nothing, which is unanswerable.
-            raise ValidationFailed("Two items on the left are matched to the same answer.")
-        fields["prompt_items"] = left
-        fields["answer_key"] = {"pairs": mapped}
-
-    elif family is QuestionType.SEQUENCE:
-        wanted = [k for k in (_remapped(c, remap) for c in order or []) if k]
-        expected = {option["key"] for option in fields["options"]}
-        if set(wanted) != expected or len(wanted) != len(expected):
-            raise ValidationFailed(
-                "The correct order must list every item exactly once."
-            )
-        fields["answer_key"] = {"order": wanted}
-
-    elif family is QuestionType.SHORT_TEXT:
-        answers = [str(item).strip() for item in (accepted or []) if str(item).strip()]
-        if not answers:
-            raise ValidationFailed(
-                "A typed answer is marked by comparison, so it needs at least one "
-                "accepted answer to compare against."
-            )
-        if fmt is QuestionFormat.ONE_WORD and any(len(a.split()) > 4 for a in answers):
-            raise ValidationFailed(
-                "A one-word answer should be one or two words. Ask this as a short "
-                "answer instead, so it can be marked against a rubric."
-            )
-        accepted_key: dict[str, Any] = {"accepted": answers}
-        if tolerance:
-            accepted_key["tolerance"] = abs(float(tolerance))
-        fields["answer_key"] = accepted_key
-
-    elif family is QuestionType.SUBJECTIVE:
-        model_text = (model_answer or "").strip()
-        if not model_text:
-            raise ValidationFailed("A written question needs a model answer to grade against.")
-        fields["model_answer"] = model_text
-        cleaned: list[dict[str, Any]] = [
-            {"criterion": str(item.get("criterion", "")).strip(),
-             "points": float(item.get("points", 0) or 0)}
-            for item in (rubric or [])
-            if str(item.get("criterion", "")).strip()
-        ]
-        if cleaned:
-            total = sum(item["points"] for item in cleaned)
-            if total <= 0:
-                raise ValidationFailed("The rubric awards no marks.")
-            fields["rubric"] = cleaned
-            # The rubric decides what the question is worth. A mark total that
-            # disagreed with its own breakdown is the one number somebody will check
-            # by hand — and the author who set `points` explicitly is telling us the
-            # rubric is wrong, so their number loses to nothing.
-            if points is None:
-                fields["points"] = Decimal(str(total))
-            elif abs(total - float(points)) > 0.01:
-                raise ValidationFailed(
-                    f"The rubric adds up to {total:g} but the question is worth "
-                    f"{float(points):g}."
-                )
-
-    # Each independently marked part is worth one mark, so partial credit divides
-    # evenly and a four-pair grid marked three-quarters right is worth three.
-    if points is None:
-        if family is QuestionType.MATCH:
-            fields["points"] = Decimal(len(fields["answer_key"]["pairs"]))
-        elif family is QuestionType.MULTI_SELECT:
-            fields["points"] = Decimal(len(fields["answer_key"]["correct_options"]))
-        elif family is QuestionType.SEQUENCE:
-            fields["points"] = Decimal(len(fields["answer_key"]["order"]))
-
-    if fmt is QuestionFormat.FILL_BLANK and "___" not in stem:
-        raise ValidationFailed("A fill-in-the-blank needs a blank: write ____ in the sentence.")
+    # ------------------------------------------------------------- the answer
+    #
+    # One family, so this is straight-line rather than a dispatch. The dict above still
+    # sets every unused column to None explicitly: a question edited in place must not
+    # keep a stale `answer_key` or `model_answer` from a row written before D32, because
+    # a leftover key outranks nothing and confuses everything that reads it.
+    key = _remapped(correct_option, remap)
+    if key is None:
+        raise ValidationFailed("The correct answer must be one of the options.")
+    fields["correct_option"] = key
 
     return fields
 
@@ -493,38 +377,6 @@ def _remapped(key: str | None, remap: dict[str, str]) -> str | None:
     if key is None:
         return None
     return remap.get(str(key).strip().upper())
-
-
-def _rebuild_fixed(
-    chosen: list[dict[str, str]],
-    remap: dict[str, str],
-    fixed: tuple[str, ...],
-    correct_option: str | None,
-) -> tuple[list[dict[str, str]], str]:
-    """Force true/false and yes/no onto their two options, in their fixed order.
-
-    A model that returns "False" first and marks it "A" is not wrong about the answer,
-    only about the ordering — so read which *text* it chose and re-key that, rather
-    than trusting a letter whose meaning we are about to change.
-    """
-    if len(chosen) != len(fixed):
-        raise ValidationFailed(f"This question needs exactly {len(fixed)} options.")
-
-    picked = _remapped(correct_option, remap)
-    chosen_text = next(
-        (option["text"] for option in chosen if option["key"] == picked), ""
-    ).strip().lower()
-
-    rebuilt = [{"key": _OPTION_KEYS[i], "text": text} for i, text in enumerate(fixed)]
-    for index, text in enumerate(fixed):
-        if chosen_text == text.lower():
-            return rebuilt, _OPTION_KEYS[index]
-    raise ValidationFailed(
-        f"The answer must be one of {' or '.join(fixed)}."
-    )
-
-
-# ============================================================ questions
 
 
 async def write_question(
@@ -550,17 +402,7 @@ async def write_question(
         data.format,
         stem=data.stem,
         options=[option.model_dump() for option in data.options] if data.options else None,
-        prompt_items=(
-            [item.model_dump() for item in data.prompt_items] if data.prompt_items else None
-        ),
         correct_option=data.correct_option,
-        correct_options=(data.answer_key or {}).get("correct_options"),
-        accepted=(data.answer_key or {}).get("accepted"),
-        tolerance=(data.answer_key or {}).get("tolerance"),
-        pairs=(data.answer_key or {}).get("pairs"),
-        order=(data.answer_key or {}).get("order"),
-        model_answer=data.model_answer,
-        rubric=data.rubric,
         points=Decimal(str(data.points)),
     )
 
@@ -662,18 +504,7 @@ async def publish(
     missing_key = [
         q.index + 1
         for q in questions
-        if (q.type is QuestionType.MCQ and not q.correct_option)
-        or (q.type is QuestionType.SUBJECTIVE and not q.model_answer)
-        or (
-            q.type
-            in (
-                QuestionType.MULTI_SELECT,
-                QuestionType.SHORT_TEXT,
-                QuestionType.MATCH,
-                QuestionType.SEQUENCE,
-            )
-            and not q.answer_key
-        )
+        if q.type is QuestionType.MCQ and not q.correct_option
     ]
     if missing_key:
         raise ValidationFailed(
@@ -863,51 +694,13 @@ def _answer_in_words(question: Question) -> list[str]:
     pointer to one, and a printed key nobody can check against is not worth printing.
     """
     options = {option["key"]: option.get("text", "") for option in (question.options or [])}
-    items = {item["key"]: item.get("text", "") for item in (question.prompt_items or [])}
-    key = question.answer_key or {}
 
     if question.type is QuestionType.MCQ and question.correct_option:
         return [f"**{question.correct_option}.** {options.get(question.correct_option, '')}"]
 
-    if question.type is QuestionType.MULTI_SELECT:
-        return [
-            f"- **{option_key}.** {options.get(option_key, '')}"
-            for option_key in key.get("correct_options", [])
-        ]
-
-    if question.type is QuestionType.MATCH:
-        return [
-            f"- **{left}.** {items.get(left, '')} → **{right}.** {options.get(right, '')}"
-            for left, right in (key.get("pairs") or {}).items()
-        ]
-
-    if question.type is QuestionType.SEQUENCE:
-        # An ordered list, because the answer IS an order. A renderer renumbering it
-        # cannot change what it says.
-        return [
-            f"{position}. {options.get(option_key, '')}"
-            for position, option_key in enumerate(key.get("order", []), start=1)
-        ]
-
-    if question.type is QuestionType.SHORT_TEXT:
-        accepted = ", ".join(f"`{answer}`" for answer in key.get("accepted", []))
-        if not accepted:
-            return []
-        line = f"Accepted: {accepted}"
-        if key.get("tolerance"):
-            # On the same line: two plain lines are one paragraph anyway, and a
-            # tolerance that reads as a separate sentence looks like a separate rule.
-            line += f" (within {float(key['tolerance']) * 100:g}%)"
-        return [line]
-
-    lines = []
-    if question.model_answer:
-        # Blank line before the rubric, so the list is a list rather than the tail of
-        # the model answer's paragraph.
-        lines += [question.model_answer, ""]
-    for entry in question.rubric or []:
-        lines.append(f"- {entry.get('criterion', '')} ({entry.get('points', 0):g})")
-    return lines
+    # A question with no correct_option cannot be published (`publish` refuses it), so
+    # this is reachable only for a draft the author has not finished.
+    return []
 
 
 def _question_markdown(question: Question) -> list[str]:
@@ -936,16 +729,13 @@ def _question_markdown(question: Question) -> list[str]:
             f"- **{option['key']}.** {option.get('text', '')}" for option in question.options
         ]
         lines.append("")
-    elif question.type is QuestionType.SHORT_TEXT:
-        lines += ["Answer: ______________________", ""]
     else:
-        # Ruled space, so a printed paper has somewhere to write. A line of underscores
+        # Ruled space, so a printed draft has somewhere to write. A line of underscores
         # is a thematic break in Markdown, which renders as exactly the ruled line we
         # want — and stays a visible line of underscores in a plain-text viewer, so it
-        # reads correctly either way. Long answers get more of it, which is the only
-        # thing that distinguishes them on paper.
-        rules = 10 if question.format is QuestionFormat.LONG_ANSWER else 4
-        lines += ["_" * 60 for _ in range(rules)] + [""]
+        # reads correctly either way. Only an unfinished draft reaches this now: a
+        # published mcq always has its options.
+        lines += ["_" * 60 for _ in range(4)] + [""]
 
     return lines
 
@@ -1053,27 +843,123 @@ def select_chunks_by_coverage(chunks: list[Chunk], *, wanted: int) -> list[Chunk
     return unique[:wanted]
 
 
-def parse_generated(raw: str) -> list[GeneratedQuestion]:
-    """Parse the model's reply. Never regex a response into shape.
-
-    Tolerates a markdown fence and leading prose because small local models add them
-    despite being told not to; anything beyond that is a failed batch, not something
-    to repair. A repaired response is a response nobody validated.
-    """
+def _unfenced(raw: str) -> str:
+    """The reply with its markdown fence and its leading apology stripped."""
     text = raw.strip()
     if "```" in text:
         blocks = re.findall(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
         if blocks:
             text = blocks[0].strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        raise ValueError("no JSON object in response")
+    return text
 
-    payload = json.loads(text[start : end + 1])
-    items = payload.get("questions")
-    if not isinstance(items, list):
-        raise ValueError("`questions` is missing or not a list")
-    return [GeneratedQuestion.model_validate(item) for item in items]
+
+def _whole_reply(text: str) -> list[Any] | None:
+    """The happy path: the entire reply is one JSON object with a `questions` list.
+
+    Returns None — not an error — when the reply will not decode, so the caller can
+    fall back to salvaging. A bare array is accepted too: a model told to return
+    ``{"questions": [...]}`` sometimes returns the list on its own, and refusing a
+    complete answer over its outermost bracket costs a whole call.
+    """
+    start, end = text.find("{"), text.rfind("}")
+    array_start, array_end = text.find("["), text.rfind("]")
+    for opener, closer in ((start, end), (array_start, array_end)):
+        if opener == -1 or closer <= opener:
+            continue
+        try:
+            payload = json.loads(text[opener : closer + 1])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            items = payload.get("questions")
+            if isinstance(items, list):
+                return items
+            if isinstance(items, dict):
+                # One question, not wrapped in a list. Same object, one bracket short.
+                return [items]
+    return None
+
+
+def _salvage_objects(text: str) -> list[Any]:
+    """Every top-level JSON object in a reply, complete ones only.
+
+    The decoder walk that :func:`_salvage` and :func:`parse_harvested` both need. It
+    keeps whatever decoded and steps over whatever did not; it never edits a byte.
+    """
+    decoder = json.JSONDecoder()
+    found: list[Any] = []
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except (json.JSONDecodeError, ValueError):
+            # This object is the broken one. Step past its brace and try the next.
+            index = text.find("{", index + 1)
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+        index = text.find("{", end)
+    return found
+
+
+def _salvage(text: str) -> list[Any]:
+    """Every *complete* question object in a reply that would not decode as a whole.
+
+    This is not repair, and the distinction is the whole point. Nothing here edits a
+    byte of the model's output: it walks the reply with a real JSON decoder, keeps the
+    objects that decode cleanly and carry a ``stem``, and drops the one that broke
+    along with everything the break swallowed. Each survivor then goes through exactly
+    the same validation as one from a reply that parsed first time.
+
+    The failure it answers is measured, not hypothetical. On llama3.2:3b, five
+    generation calls in eight came back as un-parseable JSON — an unterminated string
+    in the fourth question, a key without quotes in the third — and an all-or-nothing
+    parser threw away the three good questions in front of the break along with one
+    to two minutes of CPU decode. `LLM_JSON_MODE` stops most of these happening at
+    all; this is what happens to the rest.
+    """
+    found: list[Any] = []
+    for value in _salvage_objects(text):
+        if isinstance(value.get("questions"), list):
+            # The wrapper decoded after all. Its contents are the answer.
+            found.extend(item for item in value["questions"] if isinstance(item, dict))
+        elif value.get("stem"):
+            found.append(value)
+    return found
+
+
+def parse_generated(raw: str) -> list[GeneratedQuestion]:
+    """Parse the model's reply. Never regex a response into shape.
+
+    Tolerates a markdown fence and leading prose because small local models add them
+    despite being told not to. Beyond that it takes the reply apart with a JSON
+    decoder rather than a regex — see :func:`_salvage` — so a batch whose fourth
+    question broke still yields its first three, and a reply with nothing complete in
+    it still raises. A repaired response would be a response nobody validated; a
+    *partially recovered* one is a smaller response validated in full.
+
+    An item that will not even fit :class:`GeneratedQuestion` is dropped rather than
+    taken as proof the batch failed: the shape rules that matter are enforced by
+    ``validate_generated``, and one malformed sibling should not cost the others.
+    """
+    text = _unfenced(raw)
+    raw_items = _whole_reply(text)
+    if raw_items is None:
+        raw_items = _salvage(text)
+    if not raw_items:
+        raise ValueError("no usable question object in response")
+
+    items: list[GeneratedQuestion] = []
+    for item in raw_items:
+        try:
+            items.append(GeneratedQuestion.model_validate(item))
+        except Exception:  # pydantic ValidationError, or not a mapping at all
+            logger.info("generated item dropped: does not fit the reply contract")
+    if not items:
+        raise ValueError("no question in the response fits the reply contract")
+    return items
 
 
 def validate_generated(
@@ -1123,15 +1009,7 @@ def validate_generated(
             spec.format,
             stem=stem,
             options=item.options,
-            prompt_items=item.prompt_items,
             correct_option=item.correct_option,
-            correct_options=item.correct_options,
-            accepted=item.accepted,
-            tolerance=item.tolerance,
-            pairs=item.pairs,
-            order=item.order,
-            model_answer=item.model_answer,
-            rubric=item.rubric,
         )
     except ValidationFailed as exc:
         return False, exc.message
@@ -1144,7 +1022,26 @@ def validate_generated(
     # sixteen items are the entire question. Checking the stem alone rejected every
     # two-sided question ever generated.
     if not _shares_vocabulary(fields, chunk_text.get(item.source_chunk_id, "")):
-        return False, "stem shares no vocabulary with its source passage"
+        # Before rejecting: is it grounded in a DIFFERENT passage from this same
+        # batch? A batch is five passages in one prompt and a small model routinely
+        # writes a good question about the third while copying the id of the first.
+        # Rejecting that throws away a sound question over a clerical error, and
+        # taking it as cited would file it under a passage it is not about — so
+        # re-attribute it to the passage it actually shares vocabulary with, and only
+        # then is the provenance true. Nothing widens here: every candidate is already
+        # in `allowed_chunk_ids`, which is this batch and nothing else.
+        rehomed = next(
+            (
+                chunk_id
+                for chunk_id in allowed_chunk_ids
+                if chunk_id != item.source_chunk_id
+                and _shares_vocabulary(fields, chunk_text.get(chunk_id, ""))
+            ),
+            None,
+        )
+        if rehomed is None:
+            return False, "stem shares no vocabulary with its source passage"
+        item.source_chunk_id = rehomed
 
     return True, ""
 
@@ -1164,17 +1061,50 @@ def _shares_vocabulary(fields: dict[str, Any], source: str) -> bool:
     Words of five letters or more, because "the", "which" and "between" appear in
     every passage ever written and would make this pass unconditionally.
     """
+    passage = set(re.findall(r"[a-z]{5,}", source.lower()))
+    if not passage:
+        return False
+
     parts = [fields["stem"]]
-    if fields["type"] in (QuestionType.MATCH, QuestionType.SEQUENCE):
-        parts += [
-            item.get("text", "")
-            for item in (fields.get("options") or []) + (fields.get("prompt_items") or [])
-        ]
 
     words = set(re.findall(r"[a-z]{5,}", " ".join(parts).lower()))
     if not words:
+        # Nothing distinctive to check. Fall through to the answer rather than
+        # passing unconditionally — a flashcard front is one word, and one word of
+        # four letters used to make this check a no-op.
+        return _answer_shares_vocabulary(fields, passage)
+    if words & passage:
         return True
-    return bool(words & set(re.findall(r"[a-z]{5,}", source.lower())))
+
+    # The stem missed. Try the ANSWER before giving up: a numeric question reads
+    # "How many pairs of chromosomes does a human cell carry?" over a passage that
+    # says "23 pairs", and a true/false stem can be a short paraphrase whose only
+    # long words are the ones the passage happens to spell differently. Two shared
+    # words rather than one, because the answer text is where boilerplate lives.
+    return _answer_shares_vocabulary(fields, passage, needed=2)
+
+
+def _answer_shares_vocabulary(
+    fields: dict[str, Any], passage: set[str], *, needed: int = 1
+) -> bool:
+    """Does the ANSWER come from the passage, when the stem did not say so?
+
+    The weaker half of the check and deliberately second: an answer lifted verbatim
+    from the passage proves the question was written from it, but options can be
+    copied out of a passage the stem has nothing to do with — which is why the stem
+    is tried first and this needs more than one word to agree.
+    """
+    answers: list[str] = []
+    for option in (fields.get("options") or []) + (fields.get("prompt_items") or []):
+        answers.append(option.get("text", ""))
+    key = fields.get("answer_key") or {}
+    answers += [str(value) for value in (key.get("accepted") or [])]
+    answers.append(fields.get("model_answer") or "")
+    for criterion in fields.get("rubric") or []:
+        answers.append(str(criterion.get("criterion", "")))
+
+    words = set(re.findall(r"[a-z]{5,}", " ".join(answers).lower()))
+    return len(words & passage) >= needed
 
 
 class _StemDeduper:
@@ -1241,7 +1171,24 @@ class _CallBudget:
         self._next = 0
 
     def spent(self) -> bool:
-        return self._left <= 0 or not self._batches
+        return self.exhausted() or not self._batches
+
+    def exhausted(self) -> bool:
+        """Whether the CALL budget is gone, regardless of passages left to show.
+
+        Distinct from :meth:`spent` because harvesting brings its own passages — it
+        works from the chunks that carry the book's questions, not from the
+        round-robin — and shares this counter rather than getting a second one. One
+        wall-clock budget for the paper, however the paper is being filled.
+        """
+        return self._left <= 0
+
+    def spend(self) -> bool:
+        """Take one call for work that supplies its own passages. True if granted."""
+        if self.exhausted():
+            return False
+        self._left -= 1
+        return True
 
     def take(self) -> list[Chunk] | None:
         """The next batch of passages, or None once the budget is gone."""
@@ -1253,6 +1200,284 @@ class _CallBudget:
         return batch
 
 
+# ------------------------------------------------------- the book's own questions
+#
+# Taking a question the book already asks, rather than writing one about the same
+# passage (DECISIONS.md D31). Detection is deterministic and lives in `rag/harvest.py`;
+# what is here is the part that needs the database and the model — which chunks to draw
+# from, what context to give, and how to check that what came back is still the book's
+# question rather than a rewrite of it.
+
+
+@dataclass(frozen=True)
+class HarvestBatch:
+    """One harvesting call: questions the book asks, and the passages that answer them.
+
+    The two are separate because they usually are in the book. A textbook prints its
+    exercises at the end of a chapter and the answers throughout it, so the questions
+    come from one chunk and the passages that settle them from the several before it.
+    """
+
+    questions: list[harvest.BookQuestion]
+    passages: list[Chunk]
+    # The chunk the questions were printed in. Provenance for every question in this
+    # batch: it is where they can be found again, and it is re-checked before storing.
+    source: Chunk
+
+
+def _harvest_context(pool: list[Chunk], source: Chunk, *, span: int) -> list[Chunk]:
+    """The exercise chunk plus the passages a reader would have just read.
+
+    Preceding chunks of the same book, in reading order, because that is where the
+    answers are: an exercise at the end of a chapter is answered by the chapter. The
+    exercise chunk itself comes last, so the model reads the material and then the
+    questions — the same ordering as generation, for the same measured reason (D30).
+    """
+    before = [
+        chunk
+        for chunk in pool
+        if chunk.book_id == source.book_id
+        and chunk.index < source.index
+        and chunk.index >= source.index - span
+    ]
+    return sorted(before, key=lambda chunk: chunk.index) + [source]
+
+
+def plan_harvest(
+    pool: list[Chunk], *, minimum: int, per_call: int, span: int
+) -> list[HarvestBatch]:
+    """Every batch of book questions this material can offer, in reading order.
+
+    One batch per exercise chunk rather than one per question: the questions in an
+    exercise set share a subject and their answers share passages, so asking about six
+    of them together costs one call instead of six. ``per_call`` bounds that, because
+    a reply that runs past the token ceiling is a truncated JSON that costs the whole
+    call — the same ceiling arithmetic generation does (D30).
+    """
+    batches: list[HarvestBatch] = []
+    for chunk in pool:
+        found = harvest.find_questions(chunk.text)
+        if not found or not harvest.carries_questions(chunk.text, minimum=minimum):
+            continue
+        for start in range(0, len(found), per_call):
+            batches.append(
+                HarvestBatch(
+                    questions=found[start : start + per_call],
+                    passages=_harvest_context(pool, chunk, span=span),
+                    source=chunk,
+                )
+            )
+    return batches
+
+
+# What a harvesting reply is allowed to contribute. Everything else on the question —
+# the stem, the format, the provenance — is OURS, taken from the book and from the
+# batch, never from the reply. A model that returns a "stem" field has it ignored
+# rather than honoured, which is what makes "harvested" a checkable claim instead of
+# a hopeful one.
+_HARVEST_ANSWER_FIELDS = frozenset(
+    {
+        "options",
+        "correct_option",
+        "correct_options",
+        "prompt_items",
+        "pairs",
+        "order",
+        "accepted",
+        "tolerance",
+        "model_answer",
+        "rubric",
+        "difficulty",
+    }
+)
+
+
+def parse_harvested(raw: str) -> list[dict[str, Any]]:
+    """Parse a harvesting reply into answers keyed by the number they were asked under.
+
+    Same discipline as :func:`parse_generated` and for the same reason: recover the
+    entries that decoded, drop the one that broke, never repair. An entry with no
+    usable ``n`` is dropped here — it cannot be joined back to a question, and a
+    harvested answer with no question is not something to guess at.
+    """
+    text = _unfenced(raw)
+    payload: Any = None
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            payload = json.loads(text[start : end + 1])
+        except (json.JSONDecodeError, ValueError):
+            payload = None
+
+    items: list[Any]
+    if isinstance(payload, dict) and isinstance(payload.get("answers"), list):
+        items = payload["answers"]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = [
+            item
+            for item in _salvage_objects(text)
+            if isinstance(item, dict) and "n" in item
+        ]
+
+    answers: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            number = int(item["n"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        answers.append({**item, "n": number})
+    if not answers:
+        raise ValueError("no usable answer object in response")
+    return answers
+
+
+# A question that points at something the sitter cannot see. Harvested questions need
+# this and generated ones do not: the model is told not to reference a figure, whereas
+# the book is under no such obligation and its exercises reference figures constantly
+# ("In Fig. 6.17, (i) and (ii), DE || BC. Find EC"). Reproducing one of those on a
+# paper asks somebody to read a diagram that was never sent to them.
+_NEEDS_WHAT_IS_NOT_THERE = re.compile(
+    r"\b(?:fig(?:ure)?\.?\s*\d|table\s*\d|graph\s*\d|diagram|photograph|"
+    r"the\s+(?:figure|diagram|graph|picture|image|adjoining|alongside)|"
+    r"given\s+(?:figure|diagram|below)|shown\s+(?:in|above|below)|"
+    r"above|below|following\s+(?:figure|diagram|table))\b",
+    re.IGNORECASE,
+)
+
+
+def usable_book_question(question: harvest.BookQuestion, source_text: str) -> tuple[bool, str]:
+    """Is this a question that can honestly be put on a paper? ``(ok, reason)``.
+
+    Two checks, and the first is the one that makes harvesting trustworthy at all:
+    **the question must still be findable in the passage it is claimed to come from.**
+    Not similar to it, not about it — in it. That is a far stronger guarantee than
+    anything available for a generated question, and it is what stops "harvested from
+    the book" becoming a label on something the book never said.
+    """
+    if not _appears_in(question.text, source_text):
+        return False, "not found verbatim in its source passage"
+    if _NEEDS_WHAT_IS_NOT_THERE.search(question.text):
+        return False, "refers to a figure or diagram the sitter cannot see"
+    if _SELF_REFERENCE.search(question.text):
+        return False, "refers to the passage"
+    return True, ""
+
+
+def _appears_in(needle: str, haystack: str) -> bool:
+    """Is this question printed in this passage, allowing for the PDF's whitespace?
+
+    Whitespace-insensitive and case-insensitive, and nothing else. A PDF extractor
+    breaks lines wherever the column ended, so the question we hold has had its
+    whitespace collapsed and the chunk's has not — but every other character must
+    still match, in order. Loosening this any further would defeat the point.
+    """
+    flat = re.sub(r"\s+", " ", haystack).casefold()
+    return re.sub(r"\s+", " ", needle).casefold() in flat
+
+
+def _harvest_target(
+    preference: brief_reader.BookQuestions, *, target: int, available: int
+) -> int:
+    """How many of the paper's questions should come from the book itself.
+
+    A ceiling, never a quota. Every number here is capped by ``available`` — what the
+    material was actually found to contain — so a brief that asks for the book's
+    questions from a book that has none produces a written paper rather than a failure.
+    The author is told which happened in the trace either way.
+
+    ``AUTO`` is the interesting case: the author said nothing, so a *share* of the
+    paper is harvested where the material supports it and the rest is written. Not all
+    of it, even when the book could fill it — a paper that is entirely the
+    back-of-chapter exercises is a photocopy, and the author asked for an assessment.
+    """
+    if available <= 0 or preference is brief_reader.BookQuestions.NEVER:
+        return 0
+    if preference is brief_reader.BookQuestions.ONLY:
+        return min(target, available)
+    if preference is brief_reader.BookQuestions.PREFER:
+        # They asked for them. Take as many as the material offers, still capped by
+        # the size of the paper.
+        return min(target, available)
+    share = max(0.0, min(1.0, settings.assessment_book_question_share))
+    return min(int(target * share), available)
+
+
+async def _with_topics(
+    session: AsyncSession,
+    author: Principal,
+    topics: list[str],
+    sampled: list[Chunk],
+    *,
+    book_ids: list[UUID],
+    chapter_ids: list[UUID],
+    tracer: GenerationTrace,
+) -> list[Chunk]:
+    """Put the passages nearest the author's topics at the front of the sample.
+
+    Failure here is not failure of the run. Embeddings being down means the paper is
+    drawn from the coverage sample alone — which is what every paper before this layer
+    existed was drawn from — and that is a far better outcome than refusing to write a
+    paper because a brief mentioned a subject.
+    """
+    try:
+        vectors = await embeddings.embed_texts(topics[:6])
+        found = await fetch_topic_chunks(
+            session,
+            author,
+            topic_embeddings=vectors,
+            book_ids=book_ids,
+            chapter_ids=chapter_ids or None,
+            per_topic=settings.assessment_topic_chunks,
+            min_tokens=settings.assessment_min_chunk_tokens,
+        )
+    except Exception:
+        logger.warning("topic narrowing skipped", exc_info=True)
+        tracer.step("topics", "could not be searched; drawing from the whole selection")
+        return sampled
+
+    if not found:
+        tracer.step(
+            "topics",
+            "nothing found for "
+            + ", ".join(topics[:3])
+            + "; drawing from the whole selection",
+        )
+        return sampled
+
+    seen = {chunk.id for chunk in found}
+    merged = found + [chunk for chunk in sampled if chunk.id not in seen]
+    tracer.step(
+        "topics",
+        f"{len(found)} passage(s) matched {len(topics)} topic(s), "
+        f"sampled first out of {len(merged)}",
+    )
+    return merged
+
+
+def _failure_tag(exc: BaseException) -> str:
+    """A failed call, named well enough to act on and safely enough to store.
+
+    The trace is content-free by contract (see `GenerationTrace.call`): a provider's
+    error string can quote the request, and the request quotes the book, so the
+    message itself must never land here. But `UpstreamUnavailable` on its own told an
+    author nothing -- it reads identically whether the model server is overloaded, the
+    request timed out, or the model was never pulled, and those need different actions
+    from different people.
+
+    So: the exception class, plus the HTTP status when the cause carries one. A status
+    is a fixed vocabulary the provider chose, not text we passed it, so it discloses
+    nothing about the material. `404` is the one worth having -- it means the model
+    named in the config does not exist on the server.
+    """
+    name = type(exc).__name__
+    status = getattr(exc.__cause__, "status_code", None)
+    return f"{name} {status}" if status is not None else name
+
+
 def _shortfall_note(
     *, target: int, produced: dict[QuestionFormat, int], final: int
 ) -> str | None:
@@ -1262,26 +1487,25 @@ def _shortfall_note(
     existed nothing answered it: the paper arrived with `error` null, looking exactly
     like a one-question paper somebody meant to write.
 
-    It names the formats that produced nothing, because that is the actionable half —
-    a book about one person's life supports multiple choice and short answers and does
-    not support a four-item ordering, and the fix is for the author to stop asking for
-    one rather than to try again and hope.
+    It used to name the formats that produced nothing, which was the actionable half
+    when there were fourteen of them. With one format (D32) that list would always read
+    "Multiple choice" — naming the only thing the author could have asked for is not
+    advice — so the barren case says the plainer true thing instead: nothing usable came
+    back from this material at all.
     """
     if final >= target:
         return None
 
-    barren = [formats.SPECS[fmt].label for fmt, count in produced.items() if count == 0]
     note = f"You asked for {target} questions and this paper has {final}."
-    if barren:
+    if final == 0:
         note += (
-            " These formats could not be written from the material you chose: "
-            + ", ".join(barren)
-            + "."
+            " No questions could be written from the material you chose. A passage has "
+            "to state something definite for a question to have an answer."
         )
     note += (
-        " A thin book supports fewer questions than a long one, and asking for a format "
-        "the material cannot support returns nothing rather than something invented. "
-        "Try fewer question types, fewer questions, or a book with more in it."
+        " A thin book supports fewer questions than a long one, and a passage the "
+        "material does not settle returns nothing rather than something invented. "
+        "Try fewer questions, or a book with more in it."
     )
     return note
 
@@ -1329,7 +1553,7 @@ async def generate_questions(
     # recorder's own API — counts and formats, never question text — because a sitter
     # can read this row and RLS cannot hide a column.
     tracer = GenerationTrace(
-        model=settings.llm_model,
+        model=settings.generation_model,
         budget=settings.assessment_max_llm_calls,
         target=target,
     )
@@ -1346,6 +1570,26 @@ async def generate_questions(
         assessment.generation_trace = tracer.snapshot()
         await session.commit()
 
+    # --- layer one: understand the brief ------------------------------------
+    #
+    # Before anything is fetched, because what the author asked for decides what to
+    # fetch. "Focus on acids and bases" is a retrieval instruction; pasting it into a
+    # prompt and sampling the whole book regardless is how it used to be honoured.
+    instructions = spec.get("instructions")
+    brief = await brief_reader.read(instructions)
+    tracer.step(
+        "brief",
+        (
+            "topics: " + ", ".join(brief.topics[:4])
+            if brief.topics
+            else ("no topics named" if brief.text else "none given")
+        )
+        + (f" · avoiding {', '.join(brief.avoid[:3])}" if brief.avoid else "")
+        + f" · book questions: {brief.book_questions.value}",
+    )
+
+    # --- layer two: pull the context ----------------------------------------
+    #
     # The pool is scoped to the AUTHOR: canon plus their own uploads, never anyone
     # else's personal book (D29). This runs in the worker as the service role with
     # no RLS behind it, which is exactly why the predicate is built explicitly here.
@@ -1372,36 +1616,93 @@ async def generate_questions(
             ),
             tracer.finish(final=0),
         )
-    # The spec was written by `create_draft`, but the row is old data by the time the
-    # worker reads it: a format could have been retired between the two. Unknown values
-    # are dropped, and dropping all of them falls back to auto rather than to nothing.
-    chosen_formats = formats.resolve_formats(
-        [
-            found.format
-            for found in (formats.spec_for(value) for value in spec.get("formats", []))
-            if found is not None
-        ],
-        assessment_type=assessment.type,
-    )
+    # The spec written by `create_draft` may name formats that no longer exist -- it is
+    # old data by the time the worker reads it, and D32 retired thirteen of them. So the
+    # format is not read back from the spec at all: a paper queued before the collapse
+    # still generates, as multiple choice. Only the levels survive the round trip.
     chosen_levels = formats.resolve_levels(
         [level for level in (_difficulty(v) for v in spec.get("levels", [])) if level]
     )
-    instructions = spec.get("instructions")
 
+    # How wide to sample. Sized by the CALL BUDGET, not by the question count, and
+    # that is the fix for the failure this comment used to describe wrongly: a
+    # 461-chunk book asked for five questions sampled seven chunks — 1.5% of the book
+    # — which is two batches, and the twelve-call budget then cycled those same two
+    # batches twelve times. The model was shown the same passages over and over and
+    # duly wrote the same questions, which the deduper rejected, which triggered more
+    # backfill over the same passages. Give every call in the budget its own batch of
+    # fresh material and the duplicates stop being generated rather than being caught.
+    batch_size = settings.assessment_batch_chunks
     sampled = select_chunks_by_coverage(
-        pool, wanted=max(target, int(target * settings.assessment_oversample))
+        pool,
+        wanted=max(
+            target,
+            int(target * settings.assessment_oversample),
+            settings.assessment_max_llm_calls * batch_size,
+        ),
     )
+
+    # The topics the brief named, pulled in on top of the coverage sample rather than
+    # instead of it. Blended, not substituted, and the failure that forces the blend is
+    # this: a topic the book barely covers retrieves four thin chunks, and a paper
+    # drawn from four chunks is four questions about one paragraph. Topical chunks go
+    # to the FRONT of the sample, so the earliest batches — the ones the first pass
+    # always reaches — are the on-topic ones, and the coverage sample carries the rest.
+    if brief.topics:
+        sampled = await _with_topics(
+            session,
+            author,
+            brief.topics,
+            sampled,
+            book_ids=book_ids,
+            chapter_ids=chapter_ids,
+            tracer=tracer,
+        )
+
     chunk_text = {str(chunk.id): chunk.text for chunk in sampled}
 
-    # How many of each format to ask for. Round-robin, so a five-question paper from
-    # three formats gets all three rather than five of whichever came first.
-    plan = formats.plan_mix(chosen_formats, chosen_levels, count=target)
+    # --- layer three: what the material actually holds ----------------------
+    #
+    # Whether this book carries questions of its own, measured rather than assumed.
+    # A novel carries none; an NCERT science textbook carries seventy. The plan below
+    # is built from the answer, so a paper never promises harvested questions that the
+    # material cannot supply.
+    harvest_batches = plan_harvest(
+        pool,
+        minimum=settings.assessment_min_harvest_questions,
+        per_call=max(1, settings.assessment_reply_max_tokens // 160),
+        span=settings.assessment_batch_chunks,
+    )
+    available = sum(len(batch.questions) for batch in harvest_batches)
+
+    # --- layer four: plan generate vs. select -------------------------------
+    #
+    # How many questions at each level to ask for. Round-robin, so a five-question paper
+    # across three levels gets all three rather than five of whichever came first.
+    plan = formats.plan_mix(chosen_levels, count=target)
     per_format: dict[QuestionFormat, int] = {}
     for fmt, _level in plan:
         per_format[fmt] = per_format.get(fmt, 0) + 1
 
-    batch_size = settings.assessment_batch_chunks
-    batches = [sampled[i : i + batch_size] for i in range(0, len(sampled), batch_size)]
+    harvest_target = _harvest_target(
+        brief.book_questions, target=target, available=available
+    )
+    tracer.step(
+        "book questions",
+        f"{available} found in {len(harvest_batches)} passage(s) · "
+        + (
+            f"taking up to {harvest_target}"
+            if harvest_target
+            else "writing all questions instead"
+        ),
+    )
+
+    # Strided, not sliced. `sampled` comes back grouped by chapter, so consecutive
+    # slices make a batch that is five passages from one chapter — and a call shown
+    # five passages about the same thing writes five questions about the same thing.
+    # Striding gives every batch a cross-section of the whole book instead.
+    batch_count = max(1, (len(sampled) + batch_size - 1) // batch_size)
+    batches = [batch for i in range(batch_count) if (batch := sampled[i::batch_count])]
     tracer.step(
         "sample",
         f"{len(sampled)} of {len(pool)} chunks, spread for coverage, "
@@ -1421,7 +1722,27 @@ async def generate_questions(
     rejected = 0
     duplicates = 0
     produced: dict[QuestionFormat, int] = dict.fromkeys(per_format, 0)
+    # A format that produced nothing has told us one of two very different things,
+    # and treating them alike is what turned a JSON glitch into an empty paper: a
+    # format whose questions were *generated and rejected* cannot be written from
+    # this material, while a format whose calls died before anything was validated
+    # has told us nothing at all. Only the first is a reason to stop asking.
+    reached_validation: dict[QuestionFormat, bool] = dict.fromkeys(per_format, False)
     deduper = _StemDeduper(settings.assessment_dedupe_similarity)
+    # Which accepted stems came from the book, so the persist step can mark their
+    # provenance. Stems rather than indices because the two passes append to one list
+    # and the list is re-sorted by nothing — matching on the value is what survives
+    # that, and a stem that is both harvested and written is the same question anyway.
+    harvested_stems: set[str] = set()
+
+    # Which formats the book's questions are asked in. Only the author's own choices,
+    # because harvesting is a different SOURCE for a question, never a licence to put
+    # a format on the paper that was not asked for. A book question that cannot be
+    # honestly asked as any chosen format is dropped by the model saying so.
+    # Every remaining format can be harvested: a multiple choice printed in a book is a
+    # reproduction of that question, which is what the provenance label claims. The
+    # two-sided formats that could not honestly claim it are gone (D32).
+    harvest_formats = list(per_format)
 
     # A hard ceiling on LLM calls. Every one costs a minute or two on CPU-only Ollama,
     # and the backfill below would otherwise let a thin book and a stubborn model spin
@@ -1476,6 +1797,12 @@ async def generate_questions(
                 max_tokens=settings.assessment_reply_max_tokens,
                 request_timeout=settings.assessment_llm_timeout_seconds,
                 retries=0,
+                # Constrain the reply to JSON at the provider. The single biggest
+                # source of lost calls was a reply that was nearly right — a key
+                # without quotes in the third question, a string left open in the
+                # fourth — and a minute of CPU decode died with it. See the client.
+                json_object=True,
+                model=settings.generation_model,
             )
             items = parse_generated(raw)
         except Exception as exc:
@@ -1503,11 +1830,14 @@ async def generate_questions(
                 returned=0,
                 accepted=0,
                 reasons=[],
-                failure=type(exc).__name__,
+                failure=_failure_tag(exc),
             )
             await checkpoint()
             return 0
 
+        # The call came back and its reply parsed: whatever happens below is a fact
+        # about this format on this material, not about the transport.
+        reached_validation[fmt] = True
         got = 0
         reject_reasons: list[str] = []
         # A runaway reply — eighteen items when two were asked for — is a model that
@@ -1556,6 +1886,182 @@ async def generate_questions(
         await checkpoint()
         return got
 
+    # --- pass zero: take the questions the book already asks -----------------
+    #
+    # First, and the ordering is the design (D31). These questions were written by
+    # whoever wrote the book, they sit at the level the chapter is pitched at, and
+    # somebody revising from that book has met them before — so they get first claim
+    # on the paper, and the writing pass fills whatever they leave.
+    #
+    # The model is not asked for a question here. It is asked for the ANSWER to a
+    # question we already hold verbatim, which is a far better-conditioned task for a
+    # 3B model than inventing a stem, four distractors, a key and a provenance id at
+    # once. The stem cannot drift, because the model never returns one.
+    harvest_cursor = 0
+
+    async def take_from_book(fmt: QuestionFormat, *, wanted: int) -> int:
+        """One call: answer the next batch of the book's own questions as `fmt`.
+
+        Returns how many were accepted. Like `ask`, a batch that will not parse or
+        will not validate is logged and skipped — it costs its call and nothing more.
+        """
+        nonlocal rejected, duplicates, harvest_cursor
+
+        # Find the next batch with something usable in it. Questions are checked
+        # BEFORE the call is spent: a batch that is all figure references costs
+        # nothing rather than a minute.
+        batch: HarvestBatch | None = None
+        usable: list[harvest.BookQuestion] = []
+        skipped: list[str] = []
+        while harvest_cursor < len(harvest_batches):
+            candidate = harvest_batches[harvest_cursor]
+            harvest_cursor += 1
+            fit: list[harvest.BookQuestion] = []
+            for question in candidate.questions:
+                ok, reason = usable_book_question(question, candidate.source.text)
+                if ok:
+                    fit.append(question)
+                else:
+                    skipped.append(reason)
+            if fit:
+                batch, usable = candidate, fit
+                break
+        if batch is None or not budget.spend():
+            return 0
+
+        source_id = str(batch.source.id)
+        numbered = list(enumerate(usable[:wanted], start=1))
+        by_number = {number: question for number, question in numbered}
+        call_started = time.monotonic()
+
+        try:
+            raw = await llm.complete(
+                prompts.harvest_prompt(
+                    [
+                        (number, question.text, question.options)
+                        for number, question in numbered
+                    ],
+                    [(str(chunk.id), chunk.text) for chunk in batch.passages],
+                    fmt=fmt,
+                    rigor=assessment.rigor,
+                    instructions=instructions,
+                ),
+                max_tokens=settings.assessment_reply_max_tokens,
+                request_timeout=settings.assessment_llm_timeout_seconds,
+                retries=0,
+                json_object=True,
+                model=settings.generation_model,
+            )
+            answers = parse_harvested(raw)
+        except Exception as exc:
+            logger.warning(
+                "harvest batch failed (%s): %s: %s", fmt.value, type(exc).__name__, exc
+            )
+            tracer.call(
+                fmt,
+                ms=int((time.monotonic() - call_started) * 1000),
+                wanted=len(numbered),
+                returned=0,
+                accepted=0,
+                reasons=[],
+                failure=_failure_tag(exc),
+                harvested=True,
+            )
+            await checkpoint()
+            return 0
+
+        got = 0
+        reject_reasons = list(skipped)
+        fresh: list[GeneratedQuestion] = []
+        for answer in answers:
+            asked = by_number.get(answer["n"])
+            if asked is None:
+                # An answer to a question we did not ask. There is no stem to attach
+                # it to, and inventing one is exactly what this path exists to avoid.
+                rejected += 1
+                reject_reasons.append("answer to a question that was not asked")
+                continue
+            if not answer.get("answerable", True) or not answer.get("fits", True):
+                # The model was given a way to say "the passages do not settle this"
+                # and used it. That is the grounded-or-silent rule working, not a
+                # failure — counted, but not as a rejection of the model's output.
+                reject_reasons.append("the material does not settle this question")
+                continue
+
+            # Our stem, their answer. `format` and `source_chunk_id` are ours too:
+            # the model is never asked for provenance it could get wrong.
+            item = GeneratedQuestion.model_validate(
+                {
+                    key: value
+                    for key, value in answer.items()
+                    if key in _HARVEST_ANSWER_FIELDS
+                }
+                | {
+                    "format": fmt.value,
+                    "stem": asked.text,
+                    "source_chunk_id": source_id,
+                }
+            )
+            ok, reason = validate_generated(
+                item,
+                allowed_chunk_ids={source_id},
+                chunk_text={source_id: batch.source.text},
+                expected_format=fmt,
+            )
+            if not ok:
+                rejected += 1
+                reject_reasons.append(reason)
+                questions_rejected_total.labels(reason).inc()
+                logger.info("book question rejected (%s): %s", fmt.value, reason)
+                continue
+            fresh.append(item)
+
+        for item, novel in zip(
+            fresh, await deduper.keep([item.stem for item in fresh]), strict=True
+        ):
+            if novel:
+                accepted.append((item, fmt))
+                harvested_stems.add(item.stem)
+                got += 1
+            else:
+                rejected += 1
+                duplicates += 1
+                reason = "near-duplicate of an accepted question"
+                reject_reasons.append(reason)
+                questions_rejected_total.labels(reason).inc()
+        produced[fmt] = produced.get(fmt, 0) + got
+        tracer.call(
+            fmt,
+            ms=int((time.monotonic() - call_started) * 1000),
+            wanted=len(numbered),
+            returned=len(answers),
+            accepted=got,
+            reasons=reject_reasons,
+            harvested=True,
+        )
+        await checkpoint()
+        return got
+
+    if harvest_target > 0:
+        tracer.step(
+            "harvest",
+            f"answering up to {harvest_target} question(s) the book asks, "
+            f"across {len(harvest_formats)} format(s)",
+        )
+        await checkpoint()
+        position = 0
+        while (
+            len(accepted) < harvest_target
+            and harvest_cursor < len(harvest_batches)
+            and not budget.exhausted()
+        ):
+            fmt = harvest_formats[position % len(harvest_formats)]
+            position += 1
+            before = len(accepted)
+            await take_from_book(fmt, wanted=harvest_target - len(accepted))
+            if len(accepted) == before and harvest_cursor >= len(harvest_batches):
+                break
+
     # --- pass one: every format gets its share ------------------------------
     #
     # One call per format per batch. A format is given at most as many attempts as
@@ -1577,32 +2083,83 @@ async def generate_questions(
     # are not knowable in advance — they depend on the book, the model and the chunk —
     # so the only honest answer is to find out and then ask the ones that work for more.
     working = [fmt for fmt, count in produced.items() if count > 0]
-    if len(accepted) < target and working and not budget.spent():
+    # Formats whose every call died before a single question was looked at — a
+    # timeout, an un-parseable reply. **These are retried too, and that is the second
+    # half of the fix.** A run whose two multiple-choice calls both came back as
+    # malformed JSON used to leave `working` empty, skip the backfill entirely and
+    # fail the whole paper with "the model could not write usable questions from that
+    # material" — a diagnosis about the book, for a fault in the transport. Retrying
+    # them is not substituting a format the author did not ask for; it is finishing
+    # the ask that never got a hearing.
+    unproven = [
+        fmt
+        for fmt, count in produced.items()
+        if count == 0 and not reached_validation[fmt]
+    ]
+    retry_order = working + unproven
+    if len(accepted) < target and retry_order and not budget.spent():
         tracer.step(
             "backfill",
             f"{target - len(accepted)} short after the first pass · retrying "
-            + ", ".join(fmt.value for fmt in working),
+            + ", ".join(fmt.value for fmt in retry_order),
         )
         await checkpoint()
-    while len(accepted) < target and working and not budget.spent():
+    while len(accepted) < target and retry_order and not budget.spent():
         before = len(accepted)
-        for fmt in working:
+        for fmt in retry_order:
             if len(accepted) >= target or budget.spent():
                 break
             await ask(fmt, wanted=target - len(accepted))
-        if len(accepted) == before:
-            # A full round over every working format produced nothing new. Another
-            # round will not either, and each one costs minutes.
+        # Drop the ones that have now had their hearing and produced nothing: a
+        # format that reached validation and was rejected every time is a format this
+        # material does not support, and another round of it is another two minutes.
+        retry_order = [
+            fmt
+            for fmt in retry_order
+            if produced[fmt] > 0 or not reached_validation[fmt]
+        ]
+        if len(accepted) == before and not retry_order:
+            break
+        if len(accepted) == before and all(produced[fmt] == 0 for fmt in retry_order):
+            # A full round produced nothing new and nothing left has ever worked.
+            # Another round will not either, and each one costs minutes.
             break
 
     if not accepted:
+        # WHY the paper is empty, not a guess at it. These two failures need opposite
+        # actions from the author and used to be reported with the same sentence:
+        # "the model could not write questions from that material" sent somebody off
+        # to change chapters when the truth was that the model server never answered
+        # at all -- a missing model, a dead container, a timeout. Blaming the book for
+        # an outage is worse than saying nothing, because it is actionable and wrong.
+        trace = tracer.finish(final=0)
+        tallies = trace["summary"]["per_format"].values()
+        calls = sum(tally["calls"] for tally in tallies)
+        failed_calls = sum(tally["failed_calls"] for tally in tallies)
+        rejected = sum(tally["rejected"] for tally in tallies)
+
+        if calls and failed_calls == calls:
+            reason = (
+                "The question writer did not respond, so no questions were written. "
+                "This is a problem with the service rather than with your books — "
+                "nothing you change about the paper will help. Try again shortly, and "
+                "if it keeps happening the Advanced panel below names the failure."
+            )
+        elif rejected:
+            reason = (
+                "The question writer answered, but nothing it wrote could be used — "
+                f"{rejected} question(s) were rejected as ungrounded or malformed. "
+                "Try different chapters, or fewer questions."
+            )
+        else:
+            reason = (
+                "No questions could be written from the material you chose. A passage "
+                "has to state something definite for a question to have an answer."
+            )
+
         raise attach_trace(
-            ValidationFailed(
-                "The model could not write usable questions from that material in the "
-                "formats you chose. Try different chapters, fewer questions, or a "
-                "simpler format such as multiple choice."
-            ),
-            tracer.finish(final=0),
+            ValidationFailed(reason),
+            trace,
         )
 
     # Deduped as it was accepted, so `accepted` is already unique — the trace still
@@ -1621,8 +2178,10 @@ async def generate_questions(
     # own formatter and drops structured extras, so an extras-only line reads as
     # "generation complete" and tells nobody whether the validator did anything.
     logger.info(
-        "generation complete: %d accepted, %d rejected, %d deduped, %d final (%s)",
+        "generation complete: %d accepted (%d from the book), %d rejected, "
+        "%d deduped, %d final (%s)",
         len(accepted),
+        len(harvested_stems),
         rejected,
         duplicates,
         len(final),
@@ -1632,10 +2191,31 @@ async def generate_questions(
     questions_generated_total.inc(len(final))
     questions = []
     for index, (item, fmt) in enumerate(final):
-        built = _to_question(assessment.id, index, item, fmt)
+        built = _to_question(
+            assessment.id,
+            index,
+            item,
+            fmt,
+            # Provenance the author can see before they publish (D31). A harvested
+            # question is the book's, reproduced; a generated one is the model's
+            # first draft. Different things to publish, and different things to
+            # defend if a sitter disputes one.
+            origin=(
+                QuestionOrigin.HARVESTED
+                if item.stem in harvested_stems
+                else QuestionOrigin.GENERATED
+            ),
+        )
         if built is not None:
             questions.append(built)
-    tracer.step("persist", f"{len(questions)} questions written")
+    from_book = sum(
+        1 for question in questions if question.origin is QuestionOrigin.HARVESTED
+    )
+    tracer.step(
+        "persist",
+        f"{len(questions)} questions written"
+        + (f" · {from_book} taken from the book" if from_book else ""),
+    )
     assessment.generation_trace = tracer.finish(final=len(questions))
     # Delete-and-replace together, in the transaction the caller commits: a re-run
     # that dies before this line leaves the previous paper standing, and the
@@ -1647,7 +2227,12 @@ async def generate_questions(
 
 
 def _to_question(
-    assessment_id: UUID, index: int, item: GeneratedQuestion, fmt: QuestionFormat
+    assessment_id: UUID,
+    index: int,
+    item: GeneratedQuestion,
+    fmt: QuestionFormat,
+    *,
+    origin: QuestionOrigin = QuestionOrigin.GENERATED,
 ) -> Question | None:
     """Build the row. Returns None if the shape no longer holds.
 
@@ -1660,15 +2245,7 @@ def _to_question(
             fmt,
             stem=item.stem,
             options=item.options,
-            prompt_items=item.prompt_items,
             correct_option=item.correct_option,
-            correct_options=item.correct_options,
-            accepted=item.accepted,
-            tolerance=item.tolerance,
-            pairs=item.pairs,
-            order=item.order,
-            model_answer=item.model_answer,
-            rubric=item.rubric,
         )
     except ValidationFailed:
         logger.exception("validated question failed to build", extra={"format": fmt.value})
@@ -1679,7 +2256,7 @@ def _to_question(
         index=index,
         difficulty=_difficulty(item.difficulty),
         source_chunk_ids=[item.source_chunk_id] if item.source_chunk_id else [],
-        origin=QuestionOrigin.GENERATED,
+        origin=origin,
         **fields,
     )
 

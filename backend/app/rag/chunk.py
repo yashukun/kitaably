@@ -86,7 +86,7 @@ def detect_chapters(pages: list[Page], data: bytes, source_format: SourceFormat)
             return chapters
 
     if source_format is SourceFormat.ZIP:
-        chapters = _chapters_from_zip_parts(data, last_page)
+        chapters = _chapters_from_zip_parts(pages, data, last_page)
         if chapters:
             return chapters
 
@@ -104,7 +104,120 @@ def _chapters_from_pdf_outline(data: bytes, last_page: int) -> list[Chapter]:
     return _chapters_from_tops(tops, last_page)
 
 
-def _chapters_from_zip_parts(data: bytes, last_page: int) -> list[Chapter]:
+# --- recovering a part's real title from its opening page ---------------------
+#
+# A zip of per-chapter PDFs whose parts carry no outline gets its chapter titles
+# from the member FILENAMES, and NCERT-style downloads are named `jesc101.pdf`.
+# Fifteen chapters called "jesc101 … jesc113" is a table of contents nobody can
+# read, and it is what the reader picks from when scoping an assessment to a
+# chapter.
+#
+# So: before falling back to the filename, look at the top of the part's first
+# page for a heading. This does NOT move a boundary — the seams are still the
+# uploaded files, exactly as before — it only labels one, which is why it is
+# allowed to be a heuristic at all. `detect_chapters` refuses to guess where a
+# chapter STARTS, because a wrong split silently mislabels what a question
+# covers; a wrong title is visible to the reader the moment they look at it, and
+# an unrecognised heading falls back to the filename we would have used anyway.
+
+# "Chemical Reactions and Equations 1 CHAPTER" — title, number, then the word,
+# which is how NCERT and several other Indian school texts set a chapter opener.
+# Case-sensitive on purpose: it is the display capital that distinguishes a
+# heading from the "Chapter 1" of a cross-reference or an answer key.
+#
+# Only the ANCHOR is matched here, and the title is taken by walking back from it
+# (:func:`_title_from_page`). A pattern that captured the title directly has to
+# guess how much of what precedes the anchor belongs to it, and PDF text order
+# routinely puts a running head and a figure label in front: the real page reads
+# "Science 208 Activity 13.1 … Our Environment 13 CHAPTER", where every word
+# before "Our" is furniture.
+_CHAPTER_ANCHOR = re.compile(r"\s\d{1,2}\s+CHAPTER\b")
+
+# "CHAPTER 3 — Metals and Non-metals", or the title on the following line.
+_CHAPTER_LEADING = re.compile(
+    r"^chapter\s+\d{1,2}\b[\s:.\u2013\u2014-]*(?P<title>.*)$", re.IGNORECASE
+)
+
+# A running head sitting in front of the title on the same line: "Science 58
+# Carbon and its Compounds". Stripped only when what remains still reads as a
+# title, so it can never eat the title itself.
+_RUNNING_HEAD = re.compile(r"^[A-Z][A-Za-z]*\s+\d{1,4}\s+")
+
+# How far into the page to look. A heading is at the top or it is not a heading,
+# and searching further only finds prose that happens to name a chapter.
+_HEAD_CHARS = 200
+_HEAD_LINES = 8
+
+# The most words a chapter title is allowed to run to, and the widest walk back
+# from the anchor.
+_TITLE_WORDS = 12
+
+
+# "13.1", "8", "2)" — a figure or activity label, a page number, a section
+# number. Real chapter titles do not carry them, and page furniture is mostly
+# made of them, so one anywhere in a candidate disqualifies it. This is what
+# stops the walk-back settling on "Activity 13.1 Activity 13.1 … Our
+# Environment" and taking the whole run as a title.
+_NUMERIC_TOKEN = re.compile(r"^\d+(?:\.\d+)*[.)]?$")
+
+
+def _looks_like_title(text: str) -> bool:
+    """Whether a captured span reads as a chapter title rather than as prose."""
+    text = text.strip()
+    if not 2 <= len(text) <= 80:
+        return False
+    words = text.split()
+    if not 1 <= len(words) <= _TITLE_WORDS:
+        return False
+    if any(_NUMERIC_TOKEN.match(word) for word in words):
+        return False
+    letters = sum(character.isalpha() for character in text)
+    if letters < len(text) * 0.6:
+        return False
+    return text[0].isupper()
+
+
+def _title_from_page(text: str) -> str | None:
+    """A chapter title read off the top of a part's first page, or ``None``.
+
+    Returns ``None`` far more often than not, and that is the intended behaviour:
+    the caller falls back to the filename, which is where it started.
+    """
+    if not text:
+        return None
+
+    head = " ".join(text.split())[:_HEAD_CHARS]
+    anchor = _CHAPTER_ANCHOR.search(head)
+    if anchor:
+        before = _RUNNING_HEAD.sub("", head[: anchor.start()]).strip()
+        words = before.split()
+        # Longest first, so a real multi-word title is preferred over its own
+        # tail, and page furniture in front of it is shed a word at a time.
+        # `_looks_like_title` requiring a capital first word is what stops this
+        # at the start of the title rather than in the middle of it.
+        for count in range(min(len(words), _TITLE_WORDS), 0, -1):
+            candidate = " ".join(words[-count:])
+            if _looks_like_title(candidate):
+                return candidate[:200]
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()][:_HEAD_LINES]
+    for position, line in enumerate(lines):
+        leading = _CHAPTER_LEADING.match(line)
+        if not leading:
+            continue
+        # "CHAPTER 3: Metals" carries its title; a bare "CHAPTER 3" hands it to
+        # the next line, which is where a two-line opener puts it.
+        rest = leading.group("title").strip()
+        following = lines[position + 1] if position + 1 < len(lines) else ""
+        for option in (rest, following):
+            if _looks_like_title(option):
+                return option[:200]
+    return None
+
+
+def _chapters_from_zip_parts(
+    pages: list[Page], data: bytes, last_page: int
+) -> list[Chapter]:
     """One chapter per part, unless a part brought its own outline.
 
     The seams between the uploaded files are ground truth — whoever split the book
@@ -113,13 +226,19 @@ def _chapters_from_zip_parts(data: bytes, last_page: int) -> list[Chapter]:
     NCERT-style zip of one-chapter files gets one chapter per file, while a zip of
     two half-books keeps the halves' real chapter lists. A chunk therefore never
     spans two of the uploaded files.
+
+    Where a part has no outline, its title is read off its opening page
+    (:func:`_title_from_page`) before falling back to the member's filename. The
+    boundaries are identical either way — only the label changes.
     """
+    by_page = {page.number: page.text for page in pages}
     tops: list[tuple[str, int]] = []
     for part in parse.zip_outline(data):
         if len(part.outline) >= 2:
             tops.extend(part.outline)
         else:
-            tops.append((part.title, part.page_start))
+            recovered = _title_from_page(by_page.get(part.page_start, ""))
+            tops.append((recovered or part.title, part.page_start))
     return _chapters_from_tops([(t, p) for t, p in tops if 1 <= p <= last_page], last_page)
 
 

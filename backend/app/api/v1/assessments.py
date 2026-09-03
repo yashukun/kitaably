@@ -2,6 +2,7 @@
 
     POST   /assessments                                require_auth              -> 202
     GET    /assessments                                require_auth
+    GET    /assessments/suggestions                    require_auth
     GET    /assessments/{assessment_id}                require_assessment_author
     PATCH  /assessments/{assessment_id}                require_assessment_author
     POST   /assessments/{assessment_id}/questions      require_assessment_author
@@ -41,6 +42,7 @@ from app.schemas.assessment import (
     AssessmentDetail,
     AssessmentExportFormat,
     AssessmentRead,
+    AssessmentSuggestions,
     AssessmentUpdate,
     QuestionRead,
     QuestionWrite,
@@ -49,6 +51,7 @@ from app.schemas.attempt import AttemptSummary
 from app.schemas.common import Page
 from app.services import assessments as service
 from app.services import attempts as attempt_service
+from app.services import suggestions
 
 router = APIRouter(tags=["assessments"])
 
@@ -134,6 +137,29 @@ async def list_assessments(
     counts = await service.attempt_counts(session, [row.id for row in rows])
     return Page(
         items=[_to_read(row, principal, attempts=counts.get(row.id, 0)) for row in rows]
+    )
+
+
+# Declared BEFORE /assessments/{assessment_id}. FastAPI matches in declaration order,
+# so the literal path has to win before the parameterised one tries to read
+# "suggestions" as a UUID and 422s on it.
+@router.get("/assessments/suggestions")
+async def assessment_suggestions(
+    book_ids: list[UUID] = Query(default_factory=list),
+    principal: Principal = Depends(require_auth),
+    session: AsyncSession = Depends(get_session),
+) -> AssessmentSuggestions:
+    """Titles and focus topics for a paper drawn from these books.
+
+    `require_auth` rather than an author guard, deliberately: there is no assessment
+    yet to be the author of. The books are authorised instead, by the same
+    `draft_source_clause` `create_draft` uses — so this cannot suggest a chapter from a
+    book the caller could not actually examine on.
+    """
+    return AssessmentSuggestions.model_validate(
+        await suggestions.for_assessment(
+            session, principal, book_ids, service.draft_source_clause(principal)
+        )
     )
 
 

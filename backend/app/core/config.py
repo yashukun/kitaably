@@ -73,6 +73,49 @@ class Settings(BaseSettings):
     llm_model: str = "llama3.2:3b"
     llm_timeout_seconds: int = 120
     llm_max_retries: int = 3
+    # Ask the provider to constrain replies that get parsed to a single JSON object.
+    # Ollama and OpenAI both honour it; a provider that does not 400s on the field and
+    # the client retries once without it. Off only to reproduce the un-constrained
+    # failure mode, which is the one that used to lose five generation calls in eight.
+    llm_json_mode: bool = True
+
+    # The model for work that runs in a WORKER rather than in front of a person.
+    # Blank means "the same one", which is the default and keeps a single-model setup
+    # single-model.
+    #
+    # Two workloads, opposite trade-offs, and one setting could not serve both. Chat
+    # has somebody watching a cursor blink, so it wants the fastest model that is good
+    # enough — D21 chose llama3.2:3b for exactly that, measured. Generation and grading
+    # run on the `llm` queue where nobody is watching, take minutes either way, and are
+    # judged on whether the distractors are plausible and the rubric is sane. Making
+    # the tutor twice as slow to get better exam questions is a bad trade; making
+    # generation twice as slow is often a good one.
+    #
+    # BLANK on purpose, and the blank is a measurement rather than a default nobody
+    # revisited. qwen2.5:7b was tried here and reverted: on this box it generated at
+    # ~1 tok/s against a 180s per-call timeout, so EVERY generation call timed out and
+    # a paper came back empty -- slower than the 3B by enough to be useless, not by
+    # enough to be a trade. The cause is the Docker VM, not the model: Ollama holding
+    # two models sat at 7.9 GiB of an 11.67 GiB VM while the host itself ran at ~2x
+    # oversubscription, so the weights were competing for memory that was not there.
+    #
+    # Raise this to a bigger model when the box can feed one -- check
+    # `docker stats kitaably-ollama-1` sits well under the VM limit first, and expect
+    # to raise ASSESSMENT_LLM_TIMEOUT_SECONDS with it.
+    #
+    # Not a reasoning model, whatever the size. deepseek-r1 and its kin were considered
+    # and rejected on mechanics rather than taste: generation calls pass
+    # json_object=True, and a JSON grammar cannot emit a <think> block -- so the
+    # reasoning is either suppressed (paying 8B latency for no reasoning) or it lands
+    # inside the reply, where assessment_reply_max_tokens is spent on thought instead of
+    # questions and the first-brace parsers in services/assessments.py and
+    # services/grading.py lock onto a brace in the thinking. Nothing here strips it.
+    llm_generation_model: str = ""
+
+    @property
+    def generation_model(self) -> str:
+        """The model assessment generation, harvesting and grading actually use."""
+        return self.llm_generation_model.strip() or self.llm_model
     # Hard ceiling on an answer. Generation is the slower half of a CPU model, and
     # it is paid per token: uncapped, the tutor writes until it runs out of things to
     # say, and the reader waits for prose they stopped reading three paragraphs ago.
@@ -107,8 +150,22 @@ class Settings(BaseSettings):
     # larger half of the wait on a CPU model, and most of a 320-token passage is not
     # answering anything. 0 disables excerpting and sends the passage whole.
     retrieval_source_tokens: int = 140
-    # Cosine distance ceiling. Nothing below it -> grounded refusal, no LLM call.
+    # Cosine distance ceiling for the FIRST pass. Nothing inside it and the search
+    # falls to the salvage tier below rather than straight to a refusal.
     retrieval_max_distance: float = 0.35
+    # NOT a second, laxer retrieval ceiling -- there is no such number. Measured,
+    # bge-small puts on-topic questions at 0.17-0.29 and questions the book has
+    # nothing on at 0.36-0.45: no gap, so widening the SEARCH cannot separate
+    # "barely covered" from "not covered".
+    #
+    # This is a CORROBORATION ceiling instead, applied to the handful of passages
+    # the reader's own selective words named (rag/retrieve.py ::
+    # search_chunks_corroborated). Scored against the question as typed, those
+    # separate cleanly -- the passage that answers it at 0.36-0.38, one that
+    # merely shares a word at 0.46-0.61 -- and 0.42 sits in that gap. It is safe
+    # at this width only because nothing reaches it that the question did not
+    # name (DECISIONS.md D31).
+    retrieval_salvage_distance: float = 0.42
     # Lexical candidates for a mention question ("find every mention of X"), fused
     # with the vector hits (app/rag/shape.py, D22). Wider than TOP_K because for a
     # mention question the list of occurrences IS the product, not an input to a
@@ -199,6 +256,32 @@ class Settings(BaseSettings):
     assessment_llm_timeout_seconds: int = 180
 
     assessment_rate_limit_per_hour: int = 10
+
+    # --- Assessments: reading the author's brief ---------------------------
+    # Whether an unparsed brief gets a model call to read it. Rules first, exactly as
+    # chat intent does (D23): "focus on chapter 3" and "use the questions from the
+    # book" are patterns, not judgement calls, and a rule costs no wall clock. The
+    # model tail is for the briefs the rules do not recognise, and it is off by
+    # default because on CPU it is another minute before the first question.
+    assessment_brief_llm: bool = False
+    # How many chunks a named topic pulls into the pool, per topic. The brief narrows
+    # the pool; it never replaces it — a paper still has to span the material.
+    assessment_topic_chunks: int = 30
+
+    # --- Assessments: the book's own questions -----------------------------
+    # The share of a paper that may be taken from questions the BOOK asks, when the
+    # material actually carries them. Not a target and not a floor: it is a ceiling on
+    # how much of a paper is other people's writing. The rest is authored, because a
+    # paper that is entirely the back-of-chapter exercises is a photocopy.
+    #
+    # Zero disables harvesting entirely; 1.0 lets a paper be all book questions when
+    # the author explicitly asks for that in their brief.
+    assessment_book_question_share: float = 0.4
+    # A chunk needs this many recognisable questions in it before it is worth spending
+    # a call on. One stray question mark in a paragraph of prose is not an exercise
+    # set, and asking the model to harvest from prose returns invented questions
+    # wearing a book's clothes.
+    assessment_min_harvest_questions: int = 2
 
     # A `generating` row whose last write is older than this is dead, not slow.
     # Generation checkpoints its trace onto the row after every stage and every LLM

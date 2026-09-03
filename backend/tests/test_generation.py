@@ -319,7 +319,7 @@ def test_a_budget_with_no_passages_is_spent_immediately() -> None:
 def test_a_full_paper_says_nothing() -> None:
     """The note is for a paper that fell short. A complete one needs no explanation,
     and a notice on every paper is a notice nobody reads."""
-    produced = {QuestionFormat.MCQ: 5, QuestionFormat.TRUE_FALSE: 5}
+    produced = {QuestionFormat.MCQ: 10}
     assert _shortfall_note(target=10, produced=produced, final=10) is None
 
 
@@ -334,21 +334,12 @@ def test_a_short_paper_says_how_short() -> None:
     assert "10" in note and "1" in note
 
 
-def test_a_short_paper_names_the_formats_that_produced_nothing() -> None:
-    """The actionable half. A book about one person's life supports multiple choice and
-    short answers and does not support a four-item ordering — and the fix is for the
-    author to stop asking for one, not to try again and hope."""
-    produced = {
-        QuestionFormat.MCQ: 1,
-        QuestionFormat.MATCH: 0,
-        QuestionFormat.SEQUENCE: 0,
-        QuestionFormat.ONE_WORD: 0,
-    }
-    note = _shortfall_note(target=10, produced=produced, final=1)
-    assert SPECS[QuestionFormat.MATCH].label in note
-    assert SPECS[QuestionFormat.SEQUENCE].label in note
-    assert SPECS[QuestionFormat.ONE_WORD].label in note
-    # The one that worked is not on the list of things to stop asking for.
+def test_a_paper_with_nothing_in_it_says_so_plainly() -> None:
+    """The barren case. It used to name the formats that produced nothing, which was
+    advice when there were fourteen to choose between; naming the only format there is
+    would be telling the author to stop asking for the one thing they can ask for."""
+    note = _shortfall_note(target=10, produced={QuestionFormat.MCQ: 0}, final=0)
+    assert note is not None
     assert SPECS[QuestionFormat.MCQ].label not in note
 
 
@@ -356,9 +347,7 @@ def test_the_note_never_blames_the_author_or_the_model() -> None:
     """It is a report of what happened, in the same register as the rest of the
     product. "The model failed" is not something a reader can act on, and neither is
     being told they chose badly."""
-    note = _shortfall_note(
-        target=10, produced={QuestionFormat.MCQ: 1, QuestionFormat.MATCH: 0}, final=1
-    )
+    note = _shortfall_note(target=10, produced={QuestionFormat.MCQ: 1}, final=1)
     for word in ("failed", "error", "sorry", "unfortunately", "invalid"):
         assert word not in note.lower()
 
@@ -401,16 +390,18 @@ def test_the_ask_never_overflows_the_reply_ceiling() -> None:
 
 
 def test_a_tight_ceiling_still_asks_for_one_question() -> None:
-    """A truncated reply and no reply cost the same, so a format whose single
-    question may not fit is still worth one attempt."""
-    assert formats.batch_ask_cap(QuestionFormat.LONG_ANSWER, max_reply_tokens=100) == 1
+    """A truncated reply and no reply cost the same, so a question that may not fit in
+    the budget is still worth one attempt. Zero here would be a call that asks for
+    nothing, which is a paid round trip returning an empty array."""
+    assert formats.batch_ask_cap(QuestionFormat.MCQ, max_reply_tokens=1) == 1
 
 
-def test_a_verbose_format_is_asked_for_fewer_per_call_than_a_terse_one() -> None:
-    budget = 800
+def test_a_bigger_reply_budget_buys_more_questions_per_call() -> None:
+    """The cap is what turns a wasted truncated call into a smaller successful one, so
+    it has to actually track the budget rather than being a constant."""
     assert formats.batch_ask_cap(
-        QuestionFormat.LONG_ANSWER, max_reply_tokens=budget
-    ) < formats.batch_ask_cap(QuestionFormat.TRUE_FALSE, max_reply_tokens=budget)
+        QuestionFormat.MCQ, max_reply_tokens=100
+    ) < formats.batch_ask_cap(QuestionFormat.MCQ, max_reply_tokens=1000)
 
 
 def _generation_prompt(**overrides) -> str:

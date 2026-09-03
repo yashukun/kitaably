@@ -18,7 +18,14 @@ import {
   type AttemptSummary,
   type ExportFormat,
 } from "@/lib/api/assessments";
-import { overrideGrade, releaseResult, attemptResult, type AttemptResult } from "@/lib/api/attempts";
+import {
+  overrideGrade,
+  releaseResult,
+  attemptResult,
+  reviewReport,
+  type AttemptResult,
+  type ReviewReport,
+} from "@/lib/api/attempts";
 import { ApiRequestError } from "@/lib/api/client";
 
 /**
@@ -124,10 +131,187 @@ function ExportPaper({
 }
 
 
+/**
+ * The sitting report: what the author reads before deciding to release a mark.
+ *
+ * Two halves. How the paper was PACED — total time, and the gap before each answer,
+ * which is where an unusually fast run shows up. And what was OBSERVED — the camera
+ * and browser events, in the words the server recorded them in.
+ *
+ * The integrity score is a number for ordering a queue, not a probability that
+ * anybody did anything. Nothing here concludes anything about the person: the copy
+ * says "no face detected for 42s", never "cheating". That inference belongs to the
+ * author, which is the whole reason this screen exists instead of a threshold that
+ * voids a paper automatically.
+ */
+// Stills come back storage-RELATIVE, because the backend and the browser reach
+// Supabase at different hostnames. The browser supplies its own origin.
+//
+// Plain <img>, not next/image, and the lint warning about it is accepted: these are
+// short-lived signed URLs into a private bucket, so Next's optimiser would have to
+// proxy and cache a photograph of somebody sitting an exam. Expiry is the access
+// control here, and a cache outliving it is the thing to avoid.
+const stillSrc = (path: string) =>
+  `${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ""}/storage/v1${path}`;
+
+function SittingReport({ report }: { report: ReviewReport }) {
+  const mmss = (seconds: number | null) =>
+    seconds === null
+      ? "—"
+      : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+
+  // Only worth flagging a pace as fast RELATIVE to this sitting: papers differ, and
+  // an absolute threshold would call every short answer suspicious.
+  const timed = report.pace.filter((p) => p.seconds !== null);
+  const median =
+    timed.length > 0
+      ? [...timed].sort((a, b) => (a.seconds ?? 0) - (b.seconds ?? 0))[
+          Math.floor(timed.length / 2)
+        ].seconds ?? 0
+      : 0;
+
+  return (
+    <div className="mt-4 flex flex-col gap-4 rounded-xl border border-parchment/12 p-4">
+      <div className="flex flex-wrap gap-6">
+        <div>
+          <p className="font-mono text-[11px] tracking-[0.02em] text-parchment-dim">
+            Time taken
+          </p>
+          <p className="mt-1 font-display text-xl">{mmss(report.total_seconds)}</p>
+        </div>
+        <div>
+          <p className="font-mono text-[11px] tracking-[0.02em] text-parchment-dim">
+            Answered
+          </p>
+          <p className="mt-1 font-display text-xl">{report.answered}</p>
+        </div>
+        {report.seconds_per_question !== null && (
+          <div>
+            <p className="font-mono text-[11px] tracking-[0.02em] text-parchment-dim">
+              Per question
+            </p>
+            <p className="mt-1 font-display text-xl">
+              {report.seconds_per_question}s
+              <span className="text-parchment-dim">
+                {" "}
+                &times;{report.question_count}
+              </span>
+            </p>
+          </div>
+        )}
+        {report.proctored && report.integrity_score !== null && (
+          <div>
+            <p className="font-mono text-[11px] tracking-[0.02em] text-parchment-dim">
+              Integrity score
+            </p>
+            <p className="mt-1 font-display text-xl">
+              {report.integrity_score}
+              <span className="text-parchment-dim">/100</span>
+            </p>
+          </div>
+        )}
+      </div>
+
+      {timed.length > 0 && (
+        <div>
+          <p className="font-mono text-[11px] tracking-[0.02em] text-parchment-dim">
+            Pace — time before each answer
+          </p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {report.pace.map((step) => {
+              const quick = step.seconds !== null && median > 0 && step.seconds < median / 4;
+              return (
+                <span
+                  key={step.question}
+                  title={`Question ${step.question}: ${mmss(step.seconds)}`}
+                  className={`rounded-md border px-2 py-1 font-mono text-[11px] ${
+                    quick
+                      ? "border-saffron/45 text-saffron"
+                      : "border-parchment/15 text-parchment-dim"
+                  }`}
+                >
+                  Q{step.question} {mmss(step.seconds)}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {report.baseline_url && (
+        <div>
+          <p className="font-mono text-[11px] tracking-[0.02em] text-parchment-dim">
+            Taken before the sitting began
+          </p>
+          {/* The comparison is YOURS to make. The app stores this and shows it; it
+              does not claim the faces match or differ, because a webcam still under
+              changing light is thin evidence of identity and a wrong automated call
+              here is an accusation. */}
+          <img
+            src={stillSrc(report.baseline_url)}
+            alt="The sitter at the start of the sitting"
+            className="mt-2 w-40 rounded-lg border border-parchment/15"
+          />
+        </div>
+      )}
+
+      <div>
+        <p className="font-mono text-[11px] tracking-[0.02em] text-parchment-dim">
+          What the sitting recorded
+        </p>
+        {!report.proctored ? (
+          <p className="mt-1.5 text-xs text-parchment-dim">
+            This paper was not proctored, so there is nothing to review but the marks.
+          </p>
+        ) : report.observations.length === 0 ? (
+          <p className="mt-1.5 text-xs text-parchment-dim">
+            Nothing was recorded during this sitting.
+          </p>
+        ) : (
+          <ul className="mt-2 flex flex-col gap-1.5">
+            {report.observations.map((item) => (
+              <li
+                key={item.event_id}
+                className={`rounded-lg border px-3 py-2 text-xs ${
+                  item.severity === "high"
+                    ? "border-saffron/40 bg-saffron/[0.06] text-parchment"
+                    : "border-parchment/12 text-parchment-dim"
+                }`}
+              >
+                <div className="flex items-start gap-3">
+                  {item.still_url && (
+                    <img
+                      src={stillSrc(item.still_url)}
+                      alt=""
+                      className="w-24 shrink-0 rounded-md border border-parchment/15"
+                    />
+                  )}
+                  <span>
+                    <span className="font-mono text-[11px] text-parchment-dim">
+                      {new Date(item.occurred_at).toLocaleTimeString()}
+                    </span>{" "}
+                    {item.text}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="mt-2 text-[11px] leading-relaxed text-parchment-dim">
+          These are observations, not conclusions. A dropped connection and a closed
+          laptop look alike from here — what they mean is yours to judge.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
 export function AssessmentReview({ assessmentId }: { assessmentId: string }) {
   const [paper, setPaper] = useState<AssessmentDetail | null>(null);
   const [sittings, setSittings] = useState<AttemptSummary[]>([]);
   const [open, setOpen] = useState<AttemptResult | null>(null);
+  const [report, setReport] = useState<ReviewReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -408,6 +592,18 @@ export function AssessmentReview({ assessmentId }: { assessmentId: string }) {
                         )}
                         <button
                           onClick={async () => {
+                            setReport(
+                              report?.attempt_id === sitting.id
+                                ? null
+                                : await reviewReport(sitting.id),
+                            );
+                          }}
+                          className="rounded-lg border border-parchment/18 px-3 py-1.5 text-xs text-parchment-dim transition hover:border-parchment/35 hover:text-parchment"
+                        >
+                          {report?.attempt_id === sitting.id ? "Hide report" : "Report"}
+                        </button>
+                        <button
+                          onClick={async () => {
                             setOpen(open?.id === sitting.id ? null : await attemptResult(sitting.id));
                           }}
                           className="rounded-lg border border-parchment/18 px-3 py-1.5 text-xs text-parchment-dim transition hover:border-parchment/35 hover:text-parchment"
@@ -417,6 +613,9 @@ export function AssessmentReview({ assessmentId }: { assessmentId: string }) {
                       </div>
                     </div>
 
+                    {report?.attempt_id === sitting.id && (
+                      <SittingReport report={report} />
+                    )}
                     {open?.id === sitting.id && (
                       <ol className="mt-5 flex flex-col gap-3 border-t border-parchment/10 pt-5">
                         {open.answers.map((answer) => (

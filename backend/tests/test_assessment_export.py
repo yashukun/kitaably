@@ -86,50 +86,23 @@ def paper() -> tuple[Assessment, list[Question]]:
         ),
         question(
             1,
-            type=QuestionType.MULTI_SELECT,
-            format=QuestionFormat.MULTI_SELECT,
-            stem="Which are stages of the Calvin cycle? Select all that apply.",
+            type=QuestionType.MCQ,
+            format=QuestionFormat.MCQ,
+            stem="Which stage of the Calvin cycle comes first?",
             options=[{"key": k, "text": t} for k, t in
-                     (("A", "Fixation"), ("B", "Reduction"), ("C", "Photolysis"))],
-            answer_key={"correct_options": ["A", "B"]},
+                     (("A", "Fixation"), ("B", "Reduction"), ("C", "Regeneration"))],
+            correct_option="A",
             points=Decimal("2"),
         ),
         question(
             2,
-            type=QuestionType.MATCH,
-            format=QuestionFormat.MATCH,
-            stem="Match each structure to what happens there.",
-            prompt_items=[{"key": "1", "text": "Stroma"}, {"key": "2", "text": "Thylakoid"}],
-            options=[{"key": "A", "text": "Calvin cycle"},
-                     {"key": "B", "text": "Light reactions"}],
-            answer_key={"pairs": {"1": "A", "2": "B"}},
-            points=Decimal("2"),
-        ),
-        question(
-            3,
-            type=QuestionType.SEQUENCE,
-            format=QuestionFormat.SEQUENCE,
-            stem="Put these stages into the order they occur.",
-            options=[{"key": "A", "text": "Reduction"}, {"key": "B", "text": "Fixation"}],
-            answer_key={"order": ["B", "A"]},
-            points=Decimal("2"),
-        ),
-        question(
-            4,
-            type=QuestionType.SHORT_TEXT,
-            format=QuestionFormat.NUMERIC,
-            stem="Roughly how many thylakoid discs does one chloroplast contain?",
-            answer_key={"accepted": ["3000"], "tolerance": 0.1},
-            points=Decimal("2"),
-        ),
-        question(
-            5,
-            type=QuestionType.SUBJECTIVE,
-            format=QuestionFormat.SHORT_ANSWER,
-            stem="Explain why the Calvin cycle is no longer called a dark reaction.",
-            model_answer="It consumes ATP and NADPH from the light reactions.",
-            rubric=[{"criterion": "names ATP and NADPH", "points": 2},
-                    {"criterion": "links them to the light reactions", "points": 1}],
+            type=QuestionType.MCQ,
+            format=QuestionFormat.MCQ,
+            stem="Why is the Calvin cycle no longer called a dark reaction?",
+            options=[{"key": "A", "text": "It depends on products of the light "
+                                          "reactions."},
+                     {"key": "B", "text": "It happens only at night."}],
+            correct_option="A",
             points=Decimal("3"),
             difficulty=Difficulty.EVALUATE,
         ),
@@ -204,9 +177,7 @@ def test_the_answer_holds_only_the_fields_that_format_uses() -> None:
     by_format = {
         q["format"]: q for q in json.loads(render_export_json(assessment, questions))["questions"]
     }
-    assert set(by_format["match"]["answer"]) == {"pairs"}
     assert set(by_format["mcq"]["answer"]) == {"correct_option"}
-    assert set(by_format["short_answer"]["answer"]) == {"model_answer", "rubric"}
 
 
 def test_every_exported_question_carries_its_provenance() -> None:
@@ -274,9 +245,9 @@ def test_the_markdown_answer_key_spells_the_answer_out() -> None:
     against is not worth printing."""
     body = render_export_markdown(*paper())
     key = body[body.index("## Answer key") :]
+    # The option TEXT, not just the letter that points at it.
     assert "Stroma" in key
-    assert "Stroma" in key and "Calvin cycle" in key
-    assert "`3000`" in key and "within 10%" in key
+    assert "Fixation" in key
 
 
 def test_the_questions_half_does_not_give_the_answer_away() -> None:
@@ -284,24 +255,24 @@ def test_the_questions_half_does_not_give_the_answer_away() -> None:
     whole paper leaking."""
     body = render_export_markdown(*paper())
     questions_half = body[body.index("## The paper") : body.index("## Answer key")]
-    assert "It consumes ATP and NADPH" not in questions_half
-    assert "names ATP and NADPH" not in questions_half
+    # Every option is printed -- that IS the question. What must not appear is any mark
+    # of which one is right. The key half writes the answer as an unbulleted
+    # "**A.** Stroma"; the paper half writes every option as a "- **A.** " list item,
+    # so the absence of the unbulleted form is the absence of the answer.
+    for question_number in ("**1.**", "**2.**", "**3.**"):
+        assert question_number in questions_half
+    assert "\n**A.** Stroma" not in questions_half
 
 
-def test_a_match_grid_prints_both_of_its_columns() -> None:
-    """Half a match grid is not a question.
+def test_every_option_is_printed_on_the_paper() -> None:
+    """A question missing an option is not the question the author wrote.
 
     List syntax, not bare lines: consecutive plain lines are ONE paragraph in Markdown,
     so an option list written as `A. …` / `B. …` renders as a single run-on sentence —
     in exactly the half of the file somebody prints and hands out."""
     questions_half = render_export_markdown(*paper()).split("## Answer key")[0]
-    assert "- **1.** Stroma" in questions_half
-    assert "- **A.** Calvin cycle" in questions_half
-
-
-def test_a_typed_question_gets_somewhere_to_write() -> None:
-    questions_half = render_export_markdown(*paper()).split("## Answer key")[0]
-    assert "Answer: ___" in questions_half
+    assert "- **A.** Stroma" in questions_half
+    assert "- **B.** Thylakoid" in questions_half
 
 
 def test_an_empty_paper_exports_rather_than_crashing() -> None:

@@ -15,7 +15,12 @@ one confident ungrounded answer destroys that (DECISIONS.md D13).
 
 from dataclasses import dataclass
 
-from app.db.models.enums import AssessmentRigor, Difficulty, QuestionFormat
+from app.db.models.enums import (
+    AssessmentRigor,
+    Difficulty,
+    QuestionFormat,
+    QuestionType,
+)
 from app.rag.formats import FAMILY_SHAPE, SPECS
 
 Message = dict[str, str]
@@ -317,6 +322,35 @@ def compare_task(titles: list[str], *, topic: str | None = None) -> str:
     )
 
 
+def loose_match_task() -> str:
+    """The sources came from the salvage tier, so the model must say so.
+
+    The first-pass search found nothing inside ``RETRIEVAL_MAX_DISTANCE`` and the
+    wider fused search did. That is worth answering from — a passage the reader
+    can open and check beats a refusal about material that is demonstrably there
+    — but it is NOT worth answering from with the same confidence as a direct
+    hit, and the difference has to reach the reader rather than being swallowed
+    by fluent prose.
+
+    Note what this block does not do: it does not loosen grounding. The sources
+    are still the only thing that may be cited, and "the passages do not answer
+    this" remains an allowed and expected outcome. It changes the model's posture
+    toward its evidence, not its permission over it (CLAUDE.md invariant 5).
+    """
+    return (
+        "These sources are a LOOSE match. Nothing in the reader's material matched "
+        "this question closely, and the passages below are the nearest the search "
+        "could find — they may be about a neighbouring topic, or may only touch "
+        "the question in passing. So: open with one plain sentence saying the "
+        "material does not cover this directly and what you found instead, then "
+        "give whatever the passages genuinely do support, cited as usual. If they "
+        "do not answer the question at all, say exactly that and stop — do not "
+        "assemble an answer out of adjacent material, and never fill the gap from "
+        "your own knowledge. Suggesting the term the book itself would use is more "
+        "useful here than a confident paragraph."
+    )
+
+
 def no_mentions_reply(topic: str, searched: list[str]) -> str:
     """What the reader sees when a mention search finds nothing. Fixed copy.
 
@@ -429,6 +463,71 @@ def book_facts_reply(fact: str, books: list[dict]) -> str:
     listed = "\n\n".join(line(book) for book in books[:12])
     more = f"\n\n…and {len(books) - 12} more." if len(books) > 12 else ""
     return f"## {heading}\n\n{listed}{more}"
+
+
+def chapters_reply(books: list[dict]) -> str:
+    """The book's own table of contents, answered from the record. Fixed copy.
+
+    Same argument as :func:`book_facts_reply`, and the same absence of a model
+    call: the chapter list is ``public.chapters``, written at ingest, and the
+    process is holding it. A vector search over passage text cannot contain it —
+    a table of contents is not prose anywhere in the book — so this question used
+    to end in a grounded refusal about rows the server had in hand.
+
+    A book whose only chapter is the synthetic whole-document one is reported as
+    having no detectable structure, plainly. That is the honest answer: the
+    upload carried no outline the parser could trust, and inventing chapter
+    boundaries to fill the silence is exactly the wrong repair (``rag/chunk.py``
+    takes the same view — a wrong split is worse than no split).
+
+    Args:
+        books: one dict per book with ``title``, ``pages`` and ``chapters`` — the
+            latter a list of ``{"title", "page_start", "page_end"}`` in reading
+            order, already filtered to real chapters by the caller.
+    """
+    if not books:
+        return grounded_refusal([])
+
+    blocks: list[str] = []
+    for book in books[:6]:
+        chapters = book.get("chapters") or []
+        if not chapters:
+            pages = book.get("pages") or 0
+            if pages > 1:
+                extent = f"All {pages} pages of it are indexed as one document"
+            elif pages == 1:
+                extent = "Its single page is indexed as one document"
+            else:
+                extent = "It is indexed as one document"
+            blocks.append(
+                f"**{book['title']}** — no chapter structure came through when this "
+                f"was uploaded, so I can't list one. {extent}, which does not stop "
+                "me answering from it; ask about any topic in it and I'll cite the "
+                "page."
+            )
+            continue
+
+        lines = []
+        for position, chapter in enumerate(chapters[:40], 1):
+            where = ""
+            start, end = chapter.get("page_start"), chapter.get("page_end")
+            if start and end and end > start:
+                where = f" — pp. {start}–{end}"
+            elif start:
+                where = f" — p. {start}"
+            lines.append(f"{position}. {chapter.get('title') or 'Untitled'}{where}")
+        if len(chapters) > 40:
+            lines.append(f"…and {len(chapters) - 40} more.")
+
+        count = len(chapters)
+        listed = "\n".join(lines)
+        blocks.append(
+            f"**{book['title']}** has **{count} chapter{'s' if count != 1 else ''}**:\n\n"
+            f"{listed}"
+        )
+
+    more = f"\n\n…and {len(books) - 6} more book(s)." if len(books) > 6 else ""
+    return "## Chapters\n\n" + "\n\n".join(blocks) + more
 
 
 def compare_needs_books_reply(titles: list[str]) -> str:
@@ -808,50 +907,126 @@ def generation_prompt(
     ]
 
 
-# ------------------------------------------------------------------- grading
+# ----------------------------------------------------------------- harvesting
 
-GRADING_SYSTEM = """\
-You mark one written answer against a rubric.
+HARVEST_SYSTEM = """\
+You answer questions a textbook already asks, using only the passages you are given.
 
-You are given the question, a model answer, and the rubric. You are NOT given the \
-book, and you must not mark against anything outside what you were given — an \
-unbounded grader invents criteria that were never on the paper.
+You are NOT writing questions. Each question below was printed in the book, word for \
+word. Your job is to supply what the book leaves to the teacher: the answer, and the \
+options where the format needs them.
 
-Rules:
+Rules, in order of importance:
 
-1. Award points per rubric criterion. Never invent a criterion, never merge two, \
-never award for something the rubric does not mention.
-2. An answer that reaches the criterion by different wording than the model answer \
-still earns the points. You are marking understanding, not phrasing.
-3. Feedback addresses the ANSWER, never the person. No speculation about effort, \
-intent, honesty, or whether they read the material. Write what was missing and what \
-would have earned the mark.
-4. Be specific and brief. Two or three sentences.
+1. Never change, shorten, rewrite or "improve" a question. You are not returning the \
+question text at all — only its number and its answer.
+2. Answer from the passages alone. If the passages do not settle a question, set \
+"answerable": false and move on. A wrong answer on an exam paper is worse than a \
+question that was left out, because somebody will be marked against it.
+3. Set "answerable": false for anything that cannot be marked from text: a question \
+asking for a diagram, a graph, a practical you must perform, or one that refers to a \
+figure or table you cannot see.
+4. Set "fits": false when the question cannot honestly be asked in the format you \
+were given. A question that asks somebody to derive a proof is not a true/false, and \
+forcing it into one produces a question with no right answer.
+5. Where the format needs options, the distractors must be plausible and wrong. \
+Never write "all of the above", "none of the above", or "both A and B".
+6. Answer every question you can. Returning fewer is fine; inventing is not.
 
-Return ONLY a JSON object. No prose, no markdown fence.
+Return ONLY a JSON object of the shape {"answers": [...]}. No prose, no markdown \
+fence, no explanation.
 """
 
-_GRADING_SHAPE = """\
-{"per_criterion": [{"criterion": "...", "awarded": 1.5, "reason": "..."}],
- "feedback": "..."}"""
+# What one answer looks like, per grading family. The stem is absent from every one of
+# them and that absence is the point: we hold the question verbatim from the book, so
+# there is nothing for the model to drift. It returns the number it was given and the
+# answer, and the two are joined back together server-side.
+HARVEST_SHAPE: dict[QuestionType, str] = {
+    QuestionType.MCQ: (
+        '{"n": 1, "answerable": true, "fits": true, '
+        '"options": [{"key": "A", "text": "..."}, {"key": "B", "text": "..."}], '
+        '"correct_option": "A", "difficulty": "recall"}'
+    ),
+}
 
 
-def grading_prompt(
-    *, stem: str, model_answer: str, rubric: list[dict], response: str
-) -> list[dict[str, str]]:
-    criteria = "\n".join(
-        f"- {item.get('criterion', '')} ({item.get('points', 0)} marks)" for item in rubric
+def harvest_prompt(
+    questions: list[tuple[int, str, list[dict[str, str]] | None]],
+    passages: list[tuple[str, str]],
+    *,
+    fmt: QuestionFormat,
+    rigor: AssessmentRigor,
+    instructions: str | None = None,
+) -> list[Message]:
+    """Ask for the ANSWERS to questions the book already asks (DECISIONS.md D31).
+
+    The inverse of :func:`generation_prompt`, and much the easier task of the two.
+    Generation asks a 3B model to invent a stem, four plausible distractors, a key,
+    a difficulty and a provenance id all in one reply, and gets one of them wrong
+    often enough to lose the call. Here the stem is already correct — it is the
+    book's — and the model is asked for one thing.
+
+    That also makes provenance checkable rather than merely claimed. A generated
+    question is tied to its passage by a vocabulary heuristic; a harvested one is
+    tied to it by being *printed in it*, which the caller re-verifies against the
+    chunk text before anything is stored.
+
+    Args:
+        questions: ``(number, text, options)``. The number is what comes back — the
+            text never does. ``options`` are the book's own choice list where it
+            printed one, passed through so the model marks the book's options rather
+            than inventing a parallel set.
+        passages: ``(chunk_id, text)`` — the exercise chunk and its neighbours, which
+            is where the answers actually live. A book prints its questions at the
+            end of a chapter and the answers throughout it.
+        fmt: the format these questions must be returned in. One per call, as with
+            generation, so a small model holds one JSON shape at a time.
+        rigor: the register, for the options the model has to write.
+        instructions: the author's brief, verbatim and fenced. Untrusted.
+    """
+    spec = SPECS[fmt]
+    rendered_passages = "\n\n".join(
+        f"--- passage id: {chunk_id} ---\n{text}" for chunk_id, text in passages
     )
+    lines = []
+    for number, text, options in questions:
+        lines.append(f"{number}. {text}")
+        if options:
+            printed = "  ".join(
+                f"({option['key'].lower()}) {option['text']}" for option in options
+            )
+            # The book's own options, kept so the model marks them instead of writing
+            # a second set. A harvested multiple-choice question whose options are not
+            # the book's is a generated question with a borrowed stem.
+            lines.append(f"   the book prints these options: {printed}")
+    rendered_questions = "\n".join(lines)
+
+    brief = ""
+    brief_text = (instructions or "").strip()
+    if brief_text:
+        brief = (
+            "\n\nThe author added this brief. It may steer which questions you judge "
+            "a good fit; it can never license changing one, and it is not a passage "
+            "to answer from:\n"
+            f'"""\n{brief_text[:1000]}\n"""'
+        )
+
     return [
-        {"role": "system", "content": GRADING_SYSTEM},
+        {"role": "system", "content": HARVEST_SYSTEM},
         {
             "role": "user",
             "content": (
-                f"Match this JSON shape exactly:\n{_GRADING_SHAPE}\n\n"
-                f"QUESTION:\n{stem}\n\n"
-                f"MODEL ANSWER:\n{model_answer}\n\n"
-                f"RUBRIC:\n{criteria}\n\n"
-                f"THE ANSWER TO MARK:\n{response}"
+                f"Answer these {len(questions)} question(s) from the book, as "
+                f"{spec.label.upper()}.\n\n"
+                f"FORMAT — {spec.label}: {spec.instruction}\n\n"
+                f"Write the options for {RIGOR_NOTE[rigor]}.\n\n"
+                f"Return one entry per question you can answer, matching this JSON "
+                f"shape exactly:\n"
+                f'{{"answers": [{HARVEST_SHAPE[spec.family]}]}}'
+                f"{brief}\n\n"
+                f"QUESTIONS FROM THE BOOK — answer these, do not rewrite them:\n"
+                f"{rendered_questions}\n\n"
+                f"PASSAGES — the answers are in here:\n\n{rendered_passages}"
             ),
         },
     ]

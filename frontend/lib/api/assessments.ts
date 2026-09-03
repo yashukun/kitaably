@@ -147,10 +147,9 @@ export const getAssessment = (id: string) => api<AssessmentDetail>(`/assessments
 export const createAssessment = (body: {
   title: string;
   source: { book_ids: string[]; chapter_ids?: string[] };
-  type: "mcq" | "subjective" | "mixed";
-  /** Skippable. An empty list means auto — the server picks a mix that suits the
-   *  coarse `type`, rather than refusing to write the paper. */
-  formats?: QuestionFormat[];
+  /** Skippable. An empty list means auto — the server spreads the paper over recall,
+   *  understanding and application rather than refusing to write it. There is no
+   *  `type` and no `formats`: every paper is multiple choice (D32). */
   levels?: Difficulty[];
   rigor?: Rigor;
   instructions?: string | null;
@@ -194,3 +193,14 @@ export async function exportAssessment(assessmentId: string, format: ExportForma
   );
   return { blob, filename: filename ?? `assessment.${format}` };
 }
+
+
+/**
+ * Titles and focus topics for a paper drawn from these books, from their detected
+ * chapter titles. Both lists may be empty. No model call — see
+ * `backend/app/services/suggestions.py` for why that is deliberate rather than thrifty.
+ */
+export const assessmentSuggestions = (bookIds: string[]) =>
+  api<{ titles: string[]; topics: string[] }>(
+    `/assessments/suggestions?${bookIds.map((id) => `book_ids=${id}`).join("&")}`,
+  );

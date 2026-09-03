@@ -28,7 +28,7 @@ def run_of_two_calls() -> GenerationTrace:
         reasons=["duplicate options"],
     )
     tracer.call(
-        QuestionFormat.FLASHCARD,
+        QuestionFormat.MCQ,
         ms=120_000,
         wanted=2,
         returned=0,
@@ -70,18 +70,41 @@ def test_the_summary_arithmetic_agrees_with_the_calls() -> None:
     assert summary["llm_budget"] == 12
 
 
-def test_per_format_tallies_separate_failure_from_rejection() -> None:
+def test_tallies_separate_failure_from_rejection() -> None:
     """A call that produced unparseable output and a call whose questions were
-    rejected are different findings: the first says the model cannot write this
-    format at all, the second says it nearly can. Folding them together would
-    hide the difference an author acts on."""
+    rejected are different findings: the first says the model could not answer at all,
+    the second says it nearly could. Folding them into one number would hide the
+    difference an author acts on -- a short paper because the model kept timing out
+    reads nothing like a short paper because the questions were not grounded."""
     per_format = run_of_two_calls().finish(final=2)["summary"]["per_format"]
     assert per_format["mcq"] == {
-        "calls": 1, "accepted": 2, "rejected": 1, "failed_calls": 0,
+        "calls": 2, "accepted": 2, "harvested": 0, "rejected": 1, "failed_calls": 1,
     }
-    assert per_format["flashcard"] == {
-        "calls": 1, "accepted": 0, "rejected": 0, "failed_calls": 1,
-    }
+
+
+def test_a_harvested_call_is_counted_apart_from_a_written_one() -> None:
+    """"Where did these questions come from" is the first thing an author asks of a
+    paper drawn from the book's own exercises (D31), and the two kinds of call cost
+    and behave differently enough that one tally for both answers nobody."""
+    tracer = GenerationTrace(model="m", budget=4, target=4)
+    tracer.call(
+        QuestionFormat.MCQ, ms=1000, wanted=2, returned=2, accepted=2, reasons=[]
+    )
+    tracer.call(
+        QuestionFormat.MCQ, ms=1000, wanted=3, returned=3, accepted=3, reasons=[],
+        harvested=True,
+    )
+    summary = tracer.finish(final=5)["summary"]
+
+    # Harvested is a SLICE of accepted, not a sibling: all five were accepted, three
+    # of them came from the book.
+    assert summary["accepted"] == 5
+    assert summary["harvested"] == 3
+    assert summary["per_format"]["mcq"]["harvested"] == 3
+    # And the step says which kind of call it was, without saying what it was about.
+    details = [step["detail"] for step in tracer.finish(final=5)["steps"]]
+    assert any("from the book" in detail for detail in details)
+    assert sum("from the book" in detail for detail in details) == 1
 
 
 def test_a_failed_call_never_counts_questions() -> None:
@@ -90,7 +113,7 @@ def test_a_failed_call_never_counts_questions() -> None:
     exists to report."""
     tracer = GenerationTrace(model="m", budget=2, target=2)
     tracer.call(
-        QuestionFormat.MATCH, ms=1000, wanted=2, returned=0, accepted=0,
+        QuestionFormat.MCQ, ms=1000, wanted=2, returned=0, accepted=0,
         reasons=[], failure="APITimeoutError",
     )
     summary = tracer.finish(final=0)["summary"]
@@ -159,7 +182,7 @@ def test_a_snapshot_keeps_the_content_free_contract() -> None:
         "format", "model", "started_at", "finished_at", "steps", "summary",
         "step", "detail", "ms",
         "target", "wall_ms", "llm_ms", "llm_calls", "llm_budget",
-        "accepted", "rejected", "deduped", "final", "per_format",
+        "accepted", "harvested", "rejected", "deduped", "final", "per_format",
         "calls", "failed_calls",
     } | {fmt.value for fmt in QuestionFormat}
 
@@ -194,7 +217,7 @@ def test_the_serialized_trace_contains_no_question_text() -> None:
         "format", "model", "started_at", "finished_at", "steps", "summary",
         "step", "detail", "ms",
         "target", "wall_ms", "llm_ms", "llm_calls", "llm_budget",
-        "accepted", "rejected", "deduped", "final", "per_format",
+        "accepted", "harvested", "rejected", "deduped", "final", "per_format",
         "calls", "failed_calls",
     } | {fmt.value for fmt in QuestionFormat}
 

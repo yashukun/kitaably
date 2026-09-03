@@ -60,7 +60,16 @@ async def _aggregate(session_id: str) -> None:
             )
         )
 
-        proctor_session.integrity_score = compute_integrity_score(events)
+        # The sitting's wall clock, so duration is scored as a SHARE of it rather
+        # than in absolute seconds -- being absent for most of a short sitting and
+        # briefly absent from a long one are not the same finding.
+        ended_at = proctor_session.ended_at or datetime.now(UTC)
+        sitting_seconds = max(
+            0.0, (ended_at - proctor_session.started_at).total_seconds()
+        )
+        proctor_session.integrity_score = compute_integrity_score(
+            events, sitting_seconds=sitting_seconds
+        )
         # Retention runs from when observation ended, set here from server config —
         # deliberately not settable by anything a sitter can call.
         ended = proctor_session.ended_at or datetime.now(UTC)

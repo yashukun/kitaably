@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -83,5 +84,45 @@ class MessageRead(BaseModel):
     # written before intent classification existed. The UI uses it to render a
     # greeting as a greeting rather than as a failed search.
     intent: MessageIntent | None = None
+    # The mirror of `intent`, on the tutor's messages instead of the reader's: how the
+    # turn ended. Null on user rows and on anything written before it was persisted.
+    # The UI reads it to know whether to offer "the book does cover this" on a
+    # transcript it has just reloaded, where the live pipeline event is long gone.
+    outcome: str | None = None
     citations: list[CitationRead]
+    created_at: datetime
+
+
+class ContentFeedbackCreate(BaseModel):
+    """Somebody reporting that the app failed them.
+
+    Two surfaces file this: a reader answering a grounded refusal (`source="chat"`)
+    and an author whose paper came back empty (`source="generation"`).
+
+    Both ids are optional. A chat stream can be cut off before `record_answer` files
+    the row, and the reader still saw the refusal and still deserves to answer it.
+
+    Note what is NOT here: `diagnostics`. The client does not get to describe what
+    went wrong — the server reads that off the assessment's own trace, so a report
+    cannot be talked into carrying a story the app never told.
+    """
+
+    source: Literal["chat", "generation"] = "chat"
+    message_id: UUID | None = None
+    assessment_id: UUID | None = None
+    question: str = Field(min_length=1, max_length=4000)
+    book_ids: list[UUID] = Field(default_factory=list, max_length=20)
+    # What the reader was looking at: refusal | no_mentions | loose for chat, or the
+    # error the paper failed with for generation.
+    outcome: str = Field(min_length=1, max_length=40)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class ContentFeedbackRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    question: str
+    outcome: str
+    note: str | None
     created_at: datetime

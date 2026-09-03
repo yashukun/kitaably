@@ -4,7 +4,8 @@
 # (DECISIONS.md D3). Two commands bring the world up:
 #
 #     supabase start        Postgres + pgvector, Auth, Storage, Studio
-#     docker compose up     backend, worker, beat, embeddings, redis, ollama, frontend
+#     docker compose up     backend, worker, beat, embeddings, redis, frontend
+#                           (Ollama runs on the HOST -- see `make setup-llm`)
 #
 # Containers reach the CLI stack on the host through host.docker.internal, which is
 # why DATABASE_URL and SUPABASE_URL in .env point there rather than at a service name.
@@ -51,6 +52,15 @@ services:
       context: ./embeddings
     env_file: [.env]
     ports: ["8001:8001"]
+    # The second line of defence behind EMBEDDING_CPU_MEM_ARENA=false, and the reason
+    # it exists is that the first line is a setting somebody can turn back on. This
+    # service and Ollama share one Docker VM; an allocator that grows without bound in
+    # here is a model server that thrashes over there, which is not a failure either
+    # service reports — generation just gets slow and times out. A ceiling turns that
+    # silent starvation into a loud restart of the service actually at fault.
+    # Phase 9 gives every service one of these as a k8s resource limit; this is that,
+    # early, for the one service that demonstrably needed it.
+    mem_limit: 1g
     volumes:
       # Weights and the hub download cache are both under here; keep them across
       # restarts so a container recreate is not a 130 MB download.
@@ -174,7 +184,24 @@ services:
       start_period: 120s
 
   # -------------------------------------------------------------- local LLM
+  #
+  # OFF BY DEFAULT, behind a profile. Start it with:  docker compose --profile gpu up
+  #
+  # On Apple Silicon you almost certainly do NOT want this. Docker Desktop runs a Linux
+  # VM that cannot see the Mac's GPU (`ls /dev/dri` in here is empty), so this service
+  # is CPU-only inside a guest while a host-side Ollama gets Metal and every GPU core.
+  # Measured on the same model and prompt: host 9.4 tok/s, this container could not
+  # finish 60 tokens in 170 seconds. The gap is hardware access, not tuning -- giving
+  # the VM more CPU or RAM does not close it, because the cores it is missing are the
+  # GPU's.
+  #
+  # So the default is `OPENAI_BASE_URL=http://host.docker.internal:11434/v1` and you
+  # run Ollama on the host (`make setup-llm`). This service stays for the case it is
+  # actually good for: a Linux host with a real GPU passed through, where you would
+  # point OPENAI_BASE_URL back at http://ollama:11434/v1 and add a `deploy.resources`
+  # device reservation below.
   ollama:
+    profiles: ["gpu"]
     image: ollama/ollama:latest
     ports: ["11434:11434"]
     volumes:
@@ -197,8 +224,9 @@ services:
       # sources + six turns of transcript, with room to spare. Bigger is not free --
       # the KV cache is allocated up front and scanned per token.
       OLLAMA_CONTEXT_LENGTH: "4096"
-    # Pull the model once the container is up:
-    #     docker compose exec ollama ollama pull llama3.2:3b
+    # This volume is the container's own: a model on the HOST's Ollama is not visible
+    # in here and would have to be pulled again.
+    #     docker compose --profile gpu exec ollama ollama pull llama3.2:3b
 
   # --------------------------------------------------------------- frontend
   frontend:

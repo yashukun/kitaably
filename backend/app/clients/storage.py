@@ -114,3 +114,32 @@ async def create_signed_upload_url(bucket: str, path: str) -> str:
     if not url:
         raise UpstreamUnavailable("Could not prepare the upload.")
     return url
+
+
+async def create_signed_download_url(bucket: str, path: str, *, seconds: int = 900) -> str:
+    """Mint a signed READ url and return it **storage-relative**.
+
+    The sibling of :func:`create_signed_upload_url`, and relative for the same reason:
+    this process knows Storage as ``SUPABASE_URL``, which locally is a hostname only
+    containers resolve, while the caller's browser prefixes its own
+    ``NEXT_PUBLIC_SUPABASE_URL`` + ``/storage/v1``.
+
+    Short-lived on purpose. This is how an author's browser fetches a proctoring
+    still, and a still is a photograph of somebody sitting an exam: a link that
+    outlives the page it was rendered for is a photograph that can be forwarded.
+
+    Bypasses Storage policies (service role), so the ROUTE's guard is the whole
+    authorization — this must never be reachable from anything but an author-guarded
+    path (CLAUDE.md invariant 3).
+    """
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        response = await client.post(
+            f"{settings.supabase_url}/storage/v1/object/sign/{bucket}/{path}",
+            json={"expiresIn": seconds},
+            headers=_headers("application/json"),
+        )
+    if response.status_code >= 400:
+        raise UpstreamUnavailable(f"Could not sign {bucket}/{path}: {response.text[:200]}")
+    signed = response.json().get("signedURL") or response.json().get("signedUrl") or ""
+    # Storage returns "/object/sign/..."; the browser adds its own origin + /storage/v1.
+    return signed.removeprefix("/storage/v1")

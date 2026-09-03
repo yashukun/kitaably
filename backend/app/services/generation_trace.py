@@ -44,7 +44,17 @@ class GenerationTrace:
         self._calls = 0
         self._llm_ms = 0
         self._per_format: dict[str, dict[str, int]] = {}
-        self._totals = {"accepted": 0, "rejected": 0, "deduped": 0, "final": 0}
+        # `harvested` is a slice of `accepted`, not a sibling of it: a harvested
+        # question is an accepted question that came from the book rather than from
+        # the model. Kept because "where did these questions come from" is the first
+        # thing an author asks of a paper drawn this way (D31).
+        self._totals = {
+            "accepted": 0,
+            "harvested": 0,
+            "rejected": 0,
+            "deduped": 0,
+            "final": 0,
+        }
 
     # ------------------------------------------------------------------ steps
 
@@ -67,26 +77,37 @@ class GenerationTrace:
         accepted: int,
         reasons: list[str],
         failure: str | None = None,
+        harvested: bool = False,
     ) -> None:
         """One LLM call. ``failure`` is an exception class name, never its message —
         a provider error string can quote the prompt, and the prompt quotes the book.
+
+        ``harvested`` marks a call that ANSWERED questions the book already asks
+        rather than writing new ones (D31). A fixed flag, not free text, so the
+        content-free rule this class enforces still holds: it says which kind of call
+        this was, never what the call was about.
         """
         self._calls += 1
         self._llm_ms += ms
         tally = self._per_format.setdefault(
-            fmt.value, {"calls": 0, "accepted": 0, "rejected": 0, "failed_calls": 0}
+            fmt.value,
+            {"calls": 0, "accepted": 0, "harvested": 0, "rejected": 0, "failed_calls": 0},
         )
         tally["calls"] += 1
+        label = f"{fmt.value} from the book" if harvested else fmt.value
 
         if failure is not None:
             tally["failed_calls"] += 1
-            detail = f"{fmt.value} · failed: {failure}"
+            detail = f"{label} · failed: {failure}"
         else:
             tally["accepted"] += accepted
             tally["rejected"] += len(reasons)
             self._totals["accepted"] += accepted
             self._totals["rejected"] += len(reasons)
-            detail = f"{fmt.value} · asked {wanted}, returned {returned}, accepted {accepted}"
+            if harvested:
+                tally["harvested"] = tally.get("harvested", 0) + accepted
+                self._totals["harvested"] += accepted
+            detail = f"{label} · asked {wanted}, returned {returned}, accepted {accepted}"
             if reasons:
                 detail += f" · rejected: {'; '.join(reasons)}"
         # The lap is the call itself, so `ms` is passed through rather than re-lapped:

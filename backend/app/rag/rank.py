@@ -151,6 +151,20 @@ def dedupe(hits: list[Hit]) -> list[Hit]:
     Two passes over the same problem. Same book and same page is an exact-enough
     duplicate to drop on identity alone; anything else is compared by text, because
     a chunk boundary can fall across a page boundary and the overlap survives it.
+
+    **The text comparison deliberately crosses books.** It used to require both
+    hits to come from the same book, which meant the same passage uploaded twice
+    — one textbook shared by two people, or re-uploaded under a new title — filled
+    the source budget twice over. Observed: two copies of one 232-page science
+    text returned every passage at an identical distance, so a five-source answer
+    saw two or three distinct passages, and ``vote`` split the dominance share
+    50/50 between the copies so ``route`` could never fire.
+
+    Crossing books is safe because :func:`_overlaps` tests for a *verbatim* shared
+    span rather than for similarity: two different books trip it only by carrying
+    the same text, in which case showing the reader both is padding, not
+    corroboration. Rank order is preserved, so the instance that survives is the
+    strongest hit and the citation still points at it.
     """
     kept: list[Hit] = []
     seen_pages: set[tuple[UUID, int]] = set()
@@ -162,10 +176,7 @@ def dedupe(hits: list[Hit]) -> list[Hit]:
             if key in seen_pages:
                 continue
 
-        if any(
-            other["book_id"] == hit["book_id"] and _overlaps(other["text"], hit["text"])
-            for other in kept
-        ):
+        if any(_overlaps(other["text"], hit["text"]) for other in kept):
             continue
 
         if page is not None:
@@ -175,6 +186,16 @@ def dedupe(hits: list[Hit]) -> list[Hit]:
     return kept
 
 
+# What a hit with no distance counts for in the book vote. A lexical hit has a
+# ts_rank, not a cosine distance, and the two are not comparable -- so rather than
+# invent a conversion, such a hit is scored as one that only just cleared the
+# threshold. It votes, because it IS evidence and a book that supplied it should
+# not be outvoted by a book that supplied nothing; it votes weakly, because
+# nothing here knows how good it was. Its rank position still discounts it, which
+# is the ordering the fuse already established.
+_UNSCORED_SIMILARITY = 0.65
+
+
 def vote(hits: list[Hit]) -> list[BookVote]:
     """Score each book by the evidence it contributed. Strongest first.
 
@@ -182,12 +203,20 @@ def vote(hits: list[Hit]) -> list[BookVote]:
     hit landed in the ranking. Similarity is ``1 - distance``, so a chunk at distance
     0.12 counts roughly twice what one at distance 0.34 does -- which is the whole
     point, since the second is barely inside the threshold.
+
+    A hit may carry no distance at all: lexical hits do not have one, and neither
+    does a coverage sample. Those score :data:`_UNSCORED_SIMILARITY` rather than
+    crashing on ``float(None)``, which is what they used to do the moment the
+    salvage tier started fusing lexical hits into the focused path.
     """
     totals: dict[UUID, list[float]] = {}
     titles: dict[UUID, str] = {}
 
     for rank, hit in enumerate(hits):
-        similarity = max(0.0, 1.0 - float(hit["distance"]))
+        distance = hit.get("distance")
+        similarity = (
+            _UNSCORED_SIMILARITY if distance is None else max(0.0, 1.0 - float(distance))
+        )
         totals.setdefault(hit["book_id"], []).append(similarity * (_RANK_DECAY**rank))
         titles.setdefault(hit["book_id"], hit["book_title"])
 

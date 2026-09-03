@@ -41,11 +41,19 @@ def load() -> None:
 
         logger.info(
             "loading model",
-            extra={"model": settings.embedding_model, "cache_dir": settings.model_cache_dir},
+            extra={
+                "model": settings.embedding_model,
+                "cache_dir": settings.model_cache_dir,
+                "cpu_mem_arena": settings.embedding_cpu_mem_arena,
+            },
         )
         _model = TextEmbedding(
             model_name=settings.embedding_model,
             cache_dir=settings.model_cache_dir,
+            # Passed through fastembed to the ONNX session. See the setting: with the
+            # arena on, this process grew to 4.95 GiB and starved the model server
+            # sharing its VM.
+            enable_cpu_mem_arena=settings.embedding_cpu_mem_arena,
         )
         logger.info("model loaded", extra={"model": settings.embedding_model})
 

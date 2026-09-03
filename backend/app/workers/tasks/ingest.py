@@ -304,7 +304,14 @@ async def _classify(book_id: UUID, passages: list[str]) -> None:
         return
 
     try:
-        raw = await llm.complete(prompts.classify_book_prompt(title, passages))
+        raw = await llm.complete(
+            prompts.classify_book_prompt(title, passages),
+            # `_json_object` parses this reply, so ask the provider to constrain it --
+            # the same reason every other parsing caller does. And this runs in a
+            # worker at the end of an ingest, so it takes generation's model.
+            json_object=True,
+            model=settings.generation_model,
+        )
         payload = _json_object(raw)
         kind = BookKind(str(payload.get("kind", "")).strip().lower())
         genre = str(payload.get("genre") or "").strip()[:80] or None

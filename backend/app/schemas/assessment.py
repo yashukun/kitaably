@@ -58,19 +58,15 @@ class SourceSelection(BaseModel):
 class AssessmentCreate(BaseModel):
     """What the author asked for.
 
-    `formats` and `levels` are both **skippable**, and an empty list is a choice
-    rather than a missing answer: it means *auto*, and generation picks a mix that
-    suits the coarse `type` the author did choose. Somebody drafting a quiz from a
-    novel should not have to know that `assertion_reason` exists before they can
-    press the button.
+    There is no `formats` field and no `type`: every paper is multiple choice (D32), and
+    the server does not take a request for anything else. `levels` remains **skippable**,
+    and an empty list is a choice rather than a missing answer -- it means *auto*, and
+    generation spreads the paper over recall, understand and apply.
     """
 
     title: str = Field(min_length=1, max_length=200)
     source: SourceSelection
-    type: AssessmentType = AssessmentType.MIXED
 
-    # Empty means auto. See app/rag/formats.py :: resolve_formats().
-    formats: list[QuestionFormat] = Field(default_factory=list, max_length=14)
     # Empty means auto: recall, understand, apply.
     levels: list[Difficulty] = Field(default_factory=list, max_length=6)
     rigor: AssessmentRigor = AssessmentRigor.MEDIUM
@@ -81,7 +77,15 @@ class AssessmentCreate(BaseModel):
 
     question_count: int = Field(default=10, ge=1, le=100)
     duration_minutes: int | None = Field(default=None, ge=1, le=600)
-    results_release: ResultsRelease = ResultsRelease.IMMEDIATE
+    # ON_REVIEW, not IMMEDIATE. A mark reaches the person who sat the paper when its
+    # author says so, and the author is the one who holds authority over results -- so
+    # the default is the one that asks. The old default meant a paper created without
+    # touching this field released itself the moment grading finished, which made the
+    # review gate opt-in for a product whose whole shape assumes it.
+    #
+    # Still a choice, not a rule: a five-question practice quiz where the sitter should
+    # see their score immediately is a real case, and the create form offers it.
+    results_release: ResultsRelease = ResultsRelease.ON_REVIEW
     # Camera proctoring for everyone who sits this paper. Off by default: watching
     # people is a deliberate choice the author makes, never a side effect.
     proctoring_enabled: bool = False
@@ -107,9 +111,10 @@ class OptionRead(BaseModel):
 class QuestionSitRead(BaseModel):
     """What somebody sitting the paper sees. Note the absent fields.
 
-    `format` is here because it decides how the question is drawn — a match grid and
-    a flashcard are not radio buttons. `answer_key` is not, and never can be: the
-    view this is built from does not contain the column.
+    `format` is here because it decides how the question is drawn. It is one value now
+    (D32), and it stays on the wire anyway: the renderer switching on it is what makes
+    a second format a frontend change rather than a protocol change. `answer_key` is
+    absent, and never can be present -- the view this is built from has no such column.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -120,7 +125,8 @@ class QuestionSitRead(BaseModel):
     format: QuestionFormat
     stem: str
     options: list[OptionRead] | None
-    # The left column of a match grid. Half the question, not the answer.
+    # Always null for an mcq. Kept because the view still selects the column and rows
+    # written before D32 still hold values in it.
     prompt_items: list[OptionRead] | None = None
     points: float
     difficulty: Difficulty | None
@@ -130,8 +136,9 @@ class QuestionRead(QuestionSitRead):
     """The author's view: everything, including the answer key and provenance."""
 
     correct_option: str | None
-    # {correct_options: [...]} | {accepted: [...], tolerance: n} |
-    # {pairs: {...}} | {order: [...]} — whichever this format uses.
+    # Unused since D32 -- an mcq's answer is `correct_option`. Still read back, because
+    # a question written before the collapse still has one and the author's screen
+    # should not silently drop what is stored.
     answer_key: dict[str, Any] | None = None
     model_answer: str | None
     rubric: list[dict[str, Any]] | None
@@ -147,17 +154,14 @@ class QuestionWrite(BaseModel):
     would make "how much of this paper did the model actually earn" unanswerable.
     """
 
+    # One value, and it stays on the wire so a client that sends `"format": "mcq"`
+    # still validates. `type` is derived from it by the service and never taken from
+    # the client: a question drawn as one thing and marked as another scores zero for
+    # everybody who sat it.
     format: QuestionFormat = QuestionFormat.MCQ
-    # Derived from `format` by the service, never taken from the client: a question
-    # drawn as one thing and marked as another scores zero for everybody who sat it.
-    # Kept on the model for the shape checks below.
     stem: str = Field(min_length=10, max_length=2000)
     options: list[OptionRead] | None = None
     correct_option: str | None = None
-    prompt_items: list[OptionRead] | None = None
-    answer_key: dict[str, Any] | None = None
-    model_answer: str | None = None
-    rubric: list[dict[str, Any]] | None = None
     points: float = Field(default=1, gt=0, le=100)
     difficulty: Difficulty | None = None
 
@@ -184,9 +188,9 @@ class AssessmentRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    # What was asked for, echoed back so the list can say "true/false, fill in the
-    # blank" rather than making the author open the paper to find out. Derived from
-    # `generation_spec`; empty means it was generated on auto.
+    # What was asked for, echoed back from `generation_spec`. `formats` is always
+    # ["mcq"] on a paper drafted since D32; it is still sent because an older row can
+    # name something else, and the list should say what the paper actually is.
     formats: list[QuestionFormat] = Field(default_factory=list)
     levels: list[Difficulty] = Field(default_factory=list)
 
@@ -213,3 +217,15 @@ class AssessmentAccepted(BaseModel):
 
     id: UUID
     status: AssessmentStatus
+
+
+class AssessmentSuggestions(BaseModel):
+    """What to put under the title and focus boxes once books are picked.
+
+    Both lists are advisory and both may be empty — a book with no detected outline
+    has nothing honest to suggest, and an empty strip is the right answer there. The
+    author types over any of it; nothing here is stored or implied by being shown.
+    """
+
+    titles: list[str] = Field(default_factory=list)
+    topics: list[str] = Field(default_factory=list)

@@ -226,10 +226,42 @@ def test_occurrences_and_duration_both_count() -> None:
 
 
 def test_one_event_cannot_sink_the_score_alone() -> None:
-    """A camera pointed at a wall for four hours is one capped observation, not a
-    zero — the timeline says the rest."""
+    """A single noisy detector must not alone produce a zero.
+
+    A flaky webcam reporting no_face all session is a hardware story as often as a
+    human one, and the timeline is what tells them apart — so the cap survives. What
+    changed is where it sits: at 25 it was the BINDING constraint on the case this
+    scoring exists to catch (nobody in frame for a whole sitting scored 75, which is
+    a pass), so it now bites well below that.
+    """
     wall = [_event(EventType.NO_FACE, duration_ms=4 * 3600 * 1000)]
-    assert compute_integrity_score(wall) == 75  # 100 - _PER_EVENT_CAP
+    score = compute_integrity_score(wall, sitting_seconds=4 * 3600)
+    assert score > 0, "one observation must not be an automatic zero"
+    assert score <= 100 - 60, "a camera that saw nobody all sitting must not pass"
+
+
+def test_absence_is_scored_as_a_share_of_the_sitting() -> None:
+    """The bug this replaced: penalties were absolute seconds, so being absent for
+    11.5s of a 13s sitting — ninety percent of it — scored 96/100, because 11.5s is
+    0.19 minutes. The number that carries the meaning is the proportion.
+
+    Both sittings below have the SAME absolute absence and must score differently.
+    """
+    brief_absence = [_event(EventType.NO_FACE, duration_ms=11_500)]
+
+    mostly_absent = compute_integrity_score(brief_absence, sitting_seconds=13)
+    barely_absent = compute_integrity_score(brief_absence, sitting_seconds=3600)
+
+    assert mostly_absent < 60, "absent for most of the sitting is not a pass"
+    assert barely_absent > 90, "a glance away in an hour-long exam is not a finding"
+    assert mostly_absent < barely_absent
+
+
+def test_an_instant_event_is_not_scored_by_duration() -> None:
+    """A paste has no duration, and "what share of the sitting was a paste" is not a
+    question. Its per-occurrence weight must survive the proportional path."""
+    pastes = [_event(EventType.PASTE, occurrences=3)]
+    assert compute_integrity_score(pastes, sitting_seconds=600) == 100 - 9
 
 
 def test_the_score_clamps_at_zero() -> None:

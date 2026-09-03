@@ -17,7 +17,7 @@ import re
 import pytest
 
 from app.core.errors import ValidationFailed
-from app.db.models.enums import AssessmentType, Difficulty, QuestionFormat, QuestionType
+from app.db.models.enums import Difficulty, QuestionFormat, QuestionType
 from app.rag import formats
 from app.services.assessments import build_question_fields
 from app.services.grading import _DETERMINISTIC
@@ -41,11 +41,14 @@ def test_every_spec_declares_the_format_it_is_keyed_by() -> None:
 
 
 def test_every_family_can_be_marked() -> None:
-    """The failure this exists for: a family that is neither in the deterministic table
-    nor the subjective path is graded as subjective by fall-through, which means an LLM
-    call with no rubric and a mark nobody can defend."""
-    reachable = set(_DETERMINISTIC) | {QuestionType.SUBJECTIVE}
-    assert reachable == set(QuestionType)
+    """The failure this exists for: a family with no entry in the dispatch table.
+
+    It used to be able to fall through to the subjective grader -- an LLM call with no
+    rubric, and a mark nobody could defend. Since D32 there is no fallthrough at all
+    and `grade_answer` raises instead, so this assertion is the strictly stronger one:
+    the table must cover the enum exactly, not merely between it and a default.
+    """
+    assert set(_DETERMINISTIC) == set(QuestionType)
 
 
 def test_every_family_is_actually_used_by_a_format() -> None:
@@ -90,9 +93,20 @@ def test_no_format_example_stem_refers_to_the_passage() -> None:
 
 
 def _mapping_in_the_migrations() -> dict[str, str]:
-    """The format -> family CASE from `questions_format_matches_family`."""
+    """The format -> family CASE from the LAST `questions_format_matches_family`.
+
+    `rindex`, not `index`. Migrations are forward-only and this constraint has been
+    dropped and re-added: the first occurrence is the fourteen-branch version from
+    20260825141000, which stopped being true the moment 20260902120000 replaced it.
+    Reading the first one compares Python against a mapping no database holds, and the
+    failure reads as drift rather than as a stale parser.
+
+    Anchored on "add constraint ..." rather than the bare name, because the bare name
+    also appears in that migration's `drop constraint` list -- and the text after a
+    drop contains no `when` clauses at all.
+    """
     sql = "\n".join(migration_sql())
-    start = sql.index("questions_format_matches_family")
+    start = sql.rindex("add constraint questions_format_matches_family")
     body = sql[start : sql.index("else false", start)]
     return {
         fmt: family
@@ -117,79 +131,63 @@ def test_the_migration_parser_found_something() -> None:
     assert len(_mapping_in_the_migrations()) == len(QuestionFormat)
 
 
-# --- skipping the picker is a choice -----------------------------------------
+def test_the_enum_in_postgres_holds_exactly_what_python_holds() -> None:
+    """The narrowed type is only narrow if the migration actually replaced it.
+
+    Postgres has no `ALTER TYPE ... DROP VALUE`, so narrowing means creating a new type
+    and swapping the column onto it. A migration that narrowed Python but left the type
+    alone would pass every other test here and still let a stale binary -- or a psql
+    session -- write a format nothing in this codebase can render or mark.
+    """
+    sql = "\n".join(migration_sql())
+    start = sql.rindex("create type public.question_format as enum")
+    body = sql[start : sql.index(")", start)]
+    assert set(re.findall(r"'(\w+)'", body)) == {fmt.value for fmt in QuestionFormat}
 
 
-@pytest.mark.parametrize("kind", list(AssessmentType), ids=lambda k: k.value)
-def test_an_empty_choice_resolves_to_a_usable_mix(kind: AssessmentType) -> None:
-    """Somebody drafting a quiz from a novel should not have to know that
-    `assertion_reason` exists before they can press the button."""
-    resolved = formats.resolve_formats([], assessment_type=kind)
-    assert resolved, "auto must never resolve to nothing"
+# --- what a paper is drawn as ------------------------------------------------
+
+
+def test_every_paper_is_drawn_as_multiple_choice() -> None:
+    """One format since D32, and `resolve_formats` is the single place that says so.
+
+    Everything downstream -- the prompt, the trace, the per-format quota, the renderer
+    -- keys off what this returns, so a paper that came back as something else would
+    have got there by a second code path deciding formats, which is exactly the
+    arrangement the registry exists to prevent.
+    """
+    resolved = formats.resolve_formats()
+    assert resolved == [QuestionFormat.MCQ]
     assert all(fmt in formats.SPECS for fmt in resolved)
 
 
-def test_the_auto_mix_stays_small_enough_to_feed() -> None:
-    """Every format in an auto mix is at least one LLM call, and on CPU-only Ollama a
-    call is one to two minutes — so each entry here is a minute of spinner before the
-    first backfill can start. Auto is the default path and must be fast on the WEAKEST
-    provider; a seven-format fan-out is how a ten-question paper once took over twenty
-    minutes and came back with one question. Widening a mix is a wall-clock decision,
-    not a taste one: raise `assessment_max_llm_calls` in the same change or the
-    backfill loses the calls this adds."""
-    for kind, mix in formats.AUTO_MIX.items():
-        assert len(mix) <= 4, (
-            f"AUTO_MIX[{kind.value}] has {len(mix)} formats — that is {len(mix)} LLM "
-            "calls before backfill even starts"
-        )
-
-
-def test_a_written_paper_never_auto_picks_a_multiple_choice_format() -> None:
-    """The coarse choice the author *did* make still has to be honoured."""
-    resolved = formats.resolve_formats([], assessment_type=AssessmentType.SUBJECTIVE)
-    assert all(formats.FAMILY_OF[fmt] is QuestionType.SUBJECTIVE for fmt in resolved) or all(
-        formats.FAMILY_OF[fmt] in (QuestionType.SUBJECTIVE, QuestionType.SHORT_TEXT)
-        for fmt in resolved
-    )
-
-
-def test_an_explicit_choice_is_taken_verbatim_and_deduplicated() -> None:
-    chosen = [QuestionFormat.MATCH, QuestionFormat.MCQ, QuestionFormat.MATCH]
-    assert formats.resolve_formats(chosen, assessment_type=AssessmentType.MIXED) == [
-        QuestionFormat.MATCH,
-        QuestionFormat.MCQ,
-    ]
-
-
-def test_the_coarse_type_is_derived_from_the_formats_not_the_dropdown() -> None:
-    """An author who ticked only `long_answer` has written a written paper whatever
-    the dropdown said, and the share link tells a sitter which before they commit."""
-    assert formats.derive_type([QuestionFormat.LONG_ANSWER]) is AssessmentType.SUBJECTIVE
-    assert formats.derive_type([QuestionFormat.MCQ, QuestionFormat.MATCH]) is AssessmentType.MCQ
-    assert (
-        formats.derive_type([QuestionFormat.MCQ, QuestionFormat.SHORT_ANSWER])
-        is AssessmentType.MIXED
-    )
-
-
-def test_the_mix_reaches_every_format_before_it_repeats_one() -> None:
-    """Round-robin, not random: a five-question paper from three formats gets all
+def test_the_plan_reaches_every_level_before_it_repeats_one() -> None:
+    """Round-robin, not random: a five-question paper across three levels gets all
     three. Sampling would give you five of whichever came up first often enough to be
-    a complaint and rarely enough to look like bad luck."""
-    chosen = [QuestionFormat.MCQ, QuestionFormat.TRUE_FALSE, QuestionFormat.ONE_WORD]
-    plan = formats.plan_mix(chosen, list(formats.AUTO_LEVELS), count=5)
+    a complaint and rarely enough to look like bad luck.
+
+    The levels are the axis this still steers, now that the format does not vary.
+    """
+    levels = [Difficulty.RECALL, Difficulty.UNDERSTAND, Difficulty.APPLY]
+    plan = formats.plan_mix(levels, count=5)
     assert len(plan) == 5
-    assert {fmt for fmt, _ in plan} == set(chosen)
+    assert {level for _, level in plan} == set(levels)
+    assert {fmt for fmt, _ in plan} == {QuestionFormat.MCQ}
+
+
+def test_an_empty_level_choice_still_produces_a_plan() -> None:
+    """Skipping the level picker is a choice, not a missing answer: it means the
+    default spread. A plan of nothing would be a paper of nothing."""
+    plan = formats.plan_mix([], count=4)
+    assert len(plan) == 4
+    assert {level for _, level in plan} == set(formats.AUTO_LEVELS)
 
 
 def test_the_mix_is_stable_across_two_identical_requests() -> None:
     """Same request, same shape of paper. A generated paper is hard enough to reason
     about without the plan changing underneath it."""
-    chosen = [QuestionFormat.MCQ, QuestionFormat.MATCH]
     levels = [Difficulty.RECALL, Difficulty.EVALUATE]
-    assert formats.plan_mix(chosen, levels, count=7) == formats.plan_mix(
-        chosen, levels, count=7
-    )
+    assert formats.plan_mix(levels, count=7) == formats.plan_mix(levels, count=7)
 
 
 # --- the shape builder --------------------------------------------------------
@@ -204,32 +202,20 @@ def build(fmt: QuestionFormat, **kwargs):
 
 
 def test_the_family_is_set_from_the_format_and_never_from_the_caller() -> None:
+    """`type` is derived, never accepted. A question drawn as one thing and marked as
+    another scores zero for everybody who sat it, and the client does not get a say."""
     fields = build(
-        QuestionFormat.TRUE_FALSE,
-        stem="The Calvin cycle occurs in the stroma of the chloroplast.",
-        options=[{"key": "A", "text": "True"}, {"key": "B", "text": "False"}],
+        QuestionFormat.MCQ,
+        stem="Where in the chloroplast does the Calvin cycle occur?",
+        options=[
+            {"key": "A", "text": "Stroma"},
+            {"key": "B", "text": "Thylakoid"},
+            {"key": "C", "text": "Nucleus"},
+        ],
         correct_option="A",
     )
     assert fields["type"] is QuestionType.MCQ
-    assert fields["format"] is QuestionFormat.TRUE_FALSE
-
-
-def test_a_true_false_written_the_wrong_way_round_keeps_its_answer() -> None:
-    """A model that lists False first and marks it "A" is right about the answer and
-    wrong about the ordering. Re-keying without re-reading the text it chose would
-    invert every true/false question on the paper — the worst kind of bug, because the
-    paper still looks completely normal."""
-    fields = build(
-        QuestionFormat.TRUE_FALSE,
-        stem="The Calvin cycle occurs in the stroma of the chloroplast.",
-        options=[{"key": "A", "text": "False"}, {"key": "B", "text": "True"}],
-        correct_option="A",
-    )
-    assert fields["options"] == [
-        {"key": "A", "text": "True"},
-        {"key": "B", "text": "False"},
-    ]
-    assert fields["correct_option"] == "B"
+    assert fields["format"] is QuestionFormat.MCQ
 
 
 def test_option_keys_are_ours_and_the_answer_follows_them() -> None:
@@ -249,171 +235,25 @@ def test_option_keys_are_ours_and_the_answer_follows_them() -> None:
     assert fields["correct_option"] == "B"
 
 
-def test_a_multi_select_with_one_correct_answer_is_refused() -> None:
-    """It is an ordinary multiple choice, and calling it "select all that apply" tells
-    the sitter to look for a second answer that is not there."""
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.MULTI_SELECT,
-            stem="Which of these occur inside the chloroplast? Select all that apply.",
-            options=[{"key": k, "text": k * 4} for k in "ABCD"],
-            correct_options=["A"],
-        )
+def test_the_builder_clears_every_column_an_mcq_does_not_use() -> None:
+    """The unused columns come back as None rather than being left alone.
 
-
-def test_a_multi_select_where_everything_is_correct_is_refused() -> None:
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.MULTI_SELECT,
-            stem="Which of these occur inside the chloroplast? Select all that apply.",
-            options=[{"key": k, "text": k * 4} for k in "ABCD"],
-            correct_options=list("ABCD"),
-        )
-
-
-def test_a_multi_select_is_worth_one_mark_per_correct_option() -> None:
-    """So partial credit divides evenly, and "two of the three" is worth two."""
+    They still exist on the table and rows written before D32 still hold values in
+    them, so editing such a question in place must clear what it no longer uses. A
+    leftover `answer_key` or `model_answer` beside a `correct_option` is a question
+    with two answers, and nothing downstream would agree about which one counts.
+    """
     fields = build(
-        QuestionFormat.MULTI_SELECT,
-        stem="Which of these occur inside the chloroplast? Select all that apply.",
-        options=[{"key": k, "text": k * 4} for k in "ABCDE"],
-        correct_options=["A", "C", "D"],
-    )
-    assert fields["points"] == 3
-    assert fields["answer_key"] == {"correct_options": ["A", "C", "D"]}
-
-
-def test_a_match_grid_numbers_its_left_column_and_letters_its_right() -> None:
-    """So a stored answer of {"1": "B"} can never be read the other way round, and the
-    two sides of the grid cannot be confused for one another on screen either."""
-    fields = build(
-        QuestionFormat.MATCH,
-        stem="Match each structure to what happens there.",
-        prompt_items=[{"key": "i", "text": "Stroma"}, {"key": "ii", "text": "Thylakoid"},
-                      {"key": "iii", "text": "Nucleus"}],
-        options=[{"key": "a", "text": "Calvin cycle"}, {"key": "b", "text": "Light reactions"},
-                 {"key": "c", "text": "Transcription"}],
-        pairs={"i": "a", "ii": "b", "iii": "c"},
-    )
-    assert [item["key"] for item in fields["prompt_items"]] == ["1", "2", "3"]
-    assert [option["key"] for option in fields["options"]] == ["A", "B", "C"]
-    assert fields["answer_key"] == {"pairs": {"1": "A", "2": "B", "3": "C"}}
-    # One mark per pair, so partial credit divides evenly.
-    assert fields["points"] == 3
-
-
-def test_a_match_grid_needs_every_item_matched() -> None:
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.MATCH,
-            stem="Match each structure to what happens there.",
-            prompt_items=[{"key": str(i), "text": f"item {i}"} for i in range(1, 4)],
-            options=[{"key": k, "text": f"answer {k}"} for k in "ABC"],
-            pairs={"1": "A", "2": "B"},
-        )
-
-
-def test_a_square_match_grid_refuses_a_reused_answer() -> None:
-    """Equal columns means one-to-one. Two lefts sharing a right leaves a right-hand
-    item that pairs with nothing, which the sitter cannot resolve."""
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.MATCH,
-            stem="Match each structure to what happens there.",
-            prompt_items=[{"key": str(i), "text": f"item {i}"} for i in range(1, 4)],
-            options=[{"key": k, "text": f"answer {k}"} for k in "ABC"],
-            pairs={"1": "A", "2": "A", "3": "B"},
-        )
-
-
-def test_a_sequence_must_list_every_item_exactly_once() -> None:
-    items = [{"key": k, "text": f"step {k}"} for k in "ABCD"]
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.SEQUENCE,
-            stem="Put these steps in the order they occur.",
-            options=items,
-            order=["A", "B", "C"],
-        )
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.SEQUENCE,
-            stem="Put these steps in the order they occur.",
-            options=items,
-            order=["A", "A", "B", "C"],
-        )
-
-
-def test_a_fill_in_the_blank_without_a_blank_is_refused() -> None:
-    """It reads as an ordinary multiple choice with a missing word, and the sitter
-    cannot tell which word is missing."""
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.FILL_BLANK,
-            stem="The Calvin cycle occurs in the of the chloroplast.",
-            options=[{"key": k, "text": k * 4} for k in "ABCD"],
-            correct_option="A",
-        )
-
-
-def test_a_one_word_question_needs_an_enumerated_key() -> None:
-    """It is marked by string comparison. Without a key there is nothing to compare
-    against, and every answer scores zero."""
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.ONE_WORD,
-            stem="Name the structure in which the Calvin cycle occurs.",
-            accepted=[],
-        )
-
-
-def test_a_one_word_question_refuses_a_sentence_as_its_answer() -> None:
-    """A key that is a sentence cannot be matched by string comparison, so the question
-    is unanswerable however well somebody understood it. Ask it as a short answer."""
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.ONE_WORD,
-            stem="Name the structure in which the Calvin cycle occurs.",
-            accepted=["it happens in the stroma of the chloroplast organelle"],
-        )
-
-
-def test_a_rubric_decides_what_a_written_question_is_worth() -> None:
-    fields = build(
-        QuestionFormat.SHORT_ANSWER,
-        stem="Explain why the Calvin cycle does not require light directly.",
-        model_answer="It uses ATP and NADPH produced by the light reactions.",
-        rubric=[{"criterion": "names ATP and NADPH", "points": 2},
-                {"criterion": "says they come from the light reactions", "points": 1}],
-    )
-    assert fields["points"] == 3
-
-
-def test_a_rubric_that_disagrees_with_an_explicit_mark_is_refused() -> None:
-    """A mark total that disagrees with its own breakdown is the one number somebody
-    will check by hand."""
-    from decimal import Decimal
-
-    with pytest.raises(ValidationFailed):
-        build(
-            QuestionFormat.SHORT_ANSWER,
-            stem="Explain why the Calvin cycle does not require light directly.",
-            model_answer="It uses ATP and NADPH from the light reactions.",
-            rubric=[{"criterion": "names ATP and NADPH", "points": 2}],
-            points=Decimal("5"),
-        )
-
-
-def test_changing_a_question_format_clears_the_answer_it_no_longer_uses() -> None:
-    """Every column a format does not use comes back as None rather than being left
-    alone, so a match grid edited into a true/false does not keep a stale `answer_key`
-    that outranks its new answer."""
-    fields = build(
-        QuestionFormat.TRUE_FALSE,
-        stem="The Calvin cycle occurs in the stroma of the chloroplast.",
-        options=[{"key": "A", "text": "True"}, {"key": "B", "text": "False"}],
+        QuestionFormat.MCQ,
+        stem="Where in the chloroplast does the Calvin cycle occur?",
+        options=[
+            {"key": "A", "text": "Stroma"},
+            {"key": "B", "text": "Thylakoid"},
+            {"key": "C", "text": "Nucleus"},
+        ],
         correct_option="A",
     )
+    assert fields["correct_option"] == "A"
     assert fields["answer_key"] is None
     assert fields["prompt_items"] is None
     assert fields["model_answer"] is None
@@ -521,11 +361,14 @@ def test_a_choice_list_with_no_keys_at_all_is_numbered_by_position() -> None:
 
 # --- the whole path, per format ------------------------------------------------
 #
-# parse -> validate -> row, for a well-formed reply in each of the fourteen. Each
+# parse -> validate -> row, for a well-formed reply in every format there is. Each
 # stage is covered above; this is the one that catches them disagreeing. A format
 # whose prompt asks for a field the validator does not read, or whose validator
 # accepts something the row builder cannot store, passes every test above and fails
 # once — in a worker, after the LLM call has been paid for.
+#
+# Parametrised over the enum rather than written out once, so a format added later
+# gets this coverage by being added to the fixtures below and nowhere else.
 
 PASSAGE = (
     "The Calvin cycle occurs in the stroma of the chloroplast, using ATP and NADPH "
@@ -540,98 +383,6 @@ MODEL_REPLIES: dict[QuestionFormat, dict] = {
         "options": [{"key": k, "text": t} for k, t in zip(
             "ABCD", ["Stroma", "Thylakoid membrane", "Nucleus", "Ribosome"], strict=True)],
         "correct_option": "A",
-    },
-    QuestionFormat.TRUE_FALSE: {
-        "stem": "The Calvin cycle takes place in the stroma of the chloroplast.",
-        "options": [{"key": "A", "text": "True"}, {"key": "B", "text": "False"}],
-        "correct_option": "A",
-    },
-    QuestionFormat.YES_NO: {
-        "stem": "Does the Calvin cycle depend on NADPH from the light reactions?",
-        "options": [{"key": "A", "text": "Yes"}, {"key": "B", "text": "No"}],
-        "correct_option": "A",
-    },
-    QuestionFormat.FILL_BLANK: {
-        "stem": "The Calvin cycle occurs in the ____ of the chloroplast.",
-        "options": [{"key": k, "text": t} for k, t in
-                    zip("ABCD", ["stroma", "thylakoid", "nucleus", "cytosol"], strict=True)],
-        "correct_option": "A",
-    },
-    QuestionFormat.ASSERTION_REASON: {
-        "stem": "Assertion (A): The Calvin cycle needs no light.\n"
-                "Reason (R): It consumes ATP made by the light reactions.",
-        "options": [{"key": k, "text": t} for k, t in zip("ABCD", [
-            "Both A and R are true, and R explains A",
-            "Both A and R are true, but R does not explain A",
-            "A is true but R is false",
-            "A is false but R is true"], strict=True)],
-        "correct_option": "A",
-    },
-    QuestionFormat.SCENARIO: {
-        "stem": "A grower keeps a crop in total darkness but supplies it with ATP and "
-                "NADPH directly. Which process can still run in the chloroplast?",
-        "options": [{"key": k, "text": t} for k, t in
-                    zip("ABCD", ["The Calvin cycle", "Photolysis", "Photosystem II",
-                                 "Electron transport"], strict=True)],
-        "correct_option": "A",
-    },
-    QuestionFormat.FLASHCARD: {
-        "stem": "Stroma",
-        "options": [{"key": k, "text": t} for k, t in zip("ABCD", [
-            "Where the Calvin cycle runs",
-            "Where the light reactions run",
-            "The chloroplast's outer boundary",
-            "The site of transcription"], strict=True)],
-        "correct_option": "A",
-    },
-    QuestionFormat.MULTI_SELECT: {
-        "stem": "Which of these are stages of the Calvin cycle? Select all that apply.",
-        "options": [{"key": k, "text": t} for k, t in zip("ABCDE", [
-            "Carbon fixation", "Reduction", "Regeneration", "Photolysis",
-            "Electron transport"], strict=True)],
-        "correct_options": ["A", "B", "C"],
-    },
-    QuestionFormat.MATCH: {
-        "stem": "Match each chloroplast structure to what happens there.",
-        "prompt_items": [{"key": "1", "text": "Stroma"},
-                         {"key": "2", "text": "Thylakoid membrane"},
-                         {"key": "3", "text": "Ribulose bisphosphate"}],
-        "options": [{"key": "A", "text": "The Calvin cycle"},
-                    {"key": "B", "text": "The light-dependent reactions"},
-                    {"key": "C", "text": "Regenerated at the end of the cycle"}],
-        "pairs": {"1": "A", "2": "B", "3": "C"},
-    },
-    QuestionFormat.SEQUENCE: {
-        "stem": "Put these stages of the Calvin cycle into the order they occur.",
-        "options": [{"key": "A", "text": "Reduction"},
-                    {"key": "B", "text": "Regeneration"},
-                    {"key": "C", "text": "Carbon fixation"},
-                    {"key": "D", "text": "ATP is consumed"}],
-        "order": ["C", "A", "D", "B"],
-    },
-    QuestionFormat.ONE_WORD: {
-        "stem": "Name the region of the chloroplast in which the Calvin cycle occurs.",
-        "accepted": ["stroma"],
-    },
-    QuestionFormat.NUMERIC: {
-        "stem": "Roughly how many thylakoid discs does one chloroplast contain?",
-        "accepted": ["3000"],
-        "tolerance": 0.1,
-    },
-    QuestionFormat.SHORT_ANSWER: {
-        "stem": "Explain why the Calvin cycle is not called a dark reaction any more.",
-        "model_answer": "It depends on ATP and NADPH from the light reactions, so it "
-                        "cannot run indefinitely in darkness.",
-        "rubric": [{"criterion": "names ATP and NADPH", "points": 2},
-                   {"criterion": "links them to the light reactions", "points": 1}],
-    },
-    QuestionFormat.LONG_ANSWER: {
-        "stem": "Evaluate the claim that the Calvin cycle is independent of light.",
-        "model_answer": "It is light-independent only in the sense that photons are "
-                        "not absorbed by it; it consumes the products of the light "
-                        "reactions and stops without them.",
-        "rubric": [{"criterion": "states the narrow sense in which it is true", "points": 3},
-                   {"criterion": "states the dependency on ATP and NADPH", "points": 3}],
     },
 }
 
@@ -685,17 +436,20 @@ def test_a_reply_in_the_wrong_format_is_rejected(fmt: QuestionFormat) -> None:
     from app.schemas.attempt import GeneratedQuestion
     from app.services.assessments import validate_generated
 
-    other = QuestionFormat.MCQ if fmt is not QuestionFormat.MCQ else QuestionFormat.MATCH
+    # A format the model might name that this system does not have. With one format
+    # left there is no second REAL value to ask for, and a retired name is the case
+    # that actually happens: an old prompt, a fine-tune that remembers `true_false`,
+    # or a model free-associating from the passage.
     item = GeneratedQuestion.model_validate(
-        {"format": fmt.value, "source_chunk_id": "chunk-1", **MODEL_REPLIES[fmt]}
+        {"format": "true_false", "source_chunk_id": "chunk-1", **MODEL_REPLIES[fmt]}
     )
     ok, reason = validate_generated(
         item,
         allowed_chunk_ids={"chunk-1"},
         chunk_text={"chunk-1": PASSAGE},
-        expected_format=other,
+        expected_format=fmt,
     )
-    assert ok is False and "wrong format" in reason
+    assert ok is False and reason
 
 
 def _surviving_check_constraints() -> dict[str, str]:

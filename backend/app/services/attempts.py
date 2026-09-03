@@ -11,20 +11,24 @@ The deadline is server-authoritative. A client clock is a suggestion.
 """
 
 import logging
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.clients import storage
+from app.core.config import settings
 from app.core.errors import Conflict, NotFound, ValidationFailed
 from app.core.security import Principal
-from app.db.models import Answer, Assessment, Attempt, QuestionKey, QuestionSit
+from app.db.models import Answer, Assessment, Attempt, Question, QuestionKey, QuestionSit
 from app.db.models.enums import AttemptStatus, Grader
-from app.services import audit
+from app.db.models.proctor import ProctorEvent, ProctorSession
+from app.services import audit, proctoring
 
 logger = logging.getLogger(__name__)
 
@@ -460,3 +464,140 @@ async def sitter_attempts(
         .limit(limit)
     )
     return [(attempt, assessment) for attempt, assessment in rows.all()]
+
+
+async def review_report(
+    session: AsyncSession, principal: Principal, attempt_id: UUID
+) -> dict[str, Any]:
+    """Everything the author needs before deciding to release a mark.
+
+    Three things the gradebook row cannot answer on its own: how long the sitting
+    actually took, how the time was spent across the paper, and what the camera and
+    the browser observed while it happened.
+
+    **Observations, never a verdict.** The integrity score orders a review queue; it
+    is not a probability that anybody did anything, and nothing here concludes
+    anything about the person who sat the paper. That inference is the author's to
+    make, from the timeline, and it is the entire reason this screen exists rather
+    than an automatic threshold (CLAUDE.md invariant 3 and 4).
+
+    Guarded by ``require_attempt_author`` at the route: a sitter must never reach
+    this, and their own result view stays empty until ``results_released_at`` is set.
+    """
+    attempt = await get_attempt(session, principal, attempt_id)
+
+    # Pace, from the rows that already record it. `answers.updated_at` is the last
+    # time an answer was written, so the gaps between them in question order are how
+    # long the sitter spent moving through the paper. An unanswered question has no
+    # row and simply contributes nothing rather than a zero -- a question nobody
+    # opened is not a question answered instantly.
+    rows = list(
+        await session.execute(
+            text(
+                """
+                select q."index" as position, a.updated_at
+                from public.answers a
+                join public.questions q on q.id = a.question_id
+                where a.attempt_id = cast(:attempt_id as uuid)
+                order by a.updated_at
+                """
+            ),
+            {"attempt_id": str(attempt_id)},
+        )
+    )
+
+    pace: list[dict[str, Any]] = []
+    previous = attempt.started_at
+    for row in rows:
+        seconds = None
+        if previous is not None and row.updated_at is not None:
+            seconds = max(0, int((row.updated_at - previous).total_seconds()))
+        pace.append({"question": row.position + 1, "seconds": seconds})
+        previous = row.updated_at
+
+    total_seconds = None
+    if attempt.submitted_at is not None:
+        total_seconds = max(
+            0, int((attempt.submitted_at - attempt.started_at).total_seconds())
+        )
+
+    # The sitting's own record. A paper with proctoring off has none, and that is a
+    # normal answer rather than a gap -- the author simply reviews the marks.
+    proctor_session = await session.scalar(
+        select(ProctorSession).where(ProctorSession.attempt_id == attempt_id)
+    )
+    observations: list[dict[str, Any]] = []
+    integrity: int | None = None
+    baseline_url: str | None = None
+    if proctor_session is not None:
+        events = list(
+            await session.scalars(
+                select(ProctorEvent)
+                .where(ProctorEvent.proctor_session_id == proctor_session.id)
+                .order_by(ProctorEvent.occurred_at)
+            )
+        )
+        observations = proctoring.observation_summary(events)
+        # Sign each still here, in the author-guarded path, and nowhere else. A signed
+        # link is a readable photograph of somebody sitting an exam, so it is minted
+        # only for the one caller entitled to look and expires with the page.
+        baseline_url = None
+        if proctor_session.baseline_path:
+            with suppress(Exception):
+                baseline_url = await storage.create_signed_download_url(
+                    settings.bucket_evidence, proctor_session.baseline_path
+                )
+        for item in observations:
+            path = item.pop("evidence_path", None)
+            item["still_url"] = None
+            if path:
+                # One unsigned still must not take down a whole review screen: the
+                # timeline is the evidence, the image is the illustration.
+                with suppress(Exception):
+                    item["still_url"] = await storage.create_signed_download_url(
+                        settings.bucket_evidence, path
+                    )
+        # Recomputed here rather than read off the row: the stored score is written
+        # once at close, and an author who has dismissed events since should see the
+        # number their own review produced.
+        ended = proctor_session.ended_at or attempt.submitted_at
+        sitting_seconds = (
+            max(0.0, (ended - proctor_session.started_at).total_seconds())
+            if ended is not None
+            else None
+        )
+        integrity = proctoring.compute_integrity_score(
+            events, include_dismissed=False, sitting_seconds=sitting_seconds
+        )
+
+    # A submission far faster than the paper can be read is itself an observation, and
+    # one that needs no camera. Stated as a fact with its arithmetic shown -- never as
+    # a verdict, which is the author's to reach.
+    question_count = await session.scalar(
+        select(func.count(Question.id)).where(Question.assessment_id == attempt.assessment_id)
+    )
+    per_question = (
+        total_seconds / question_count
+        if total_seconds is not None and question_count
+        else None
+    )
+
+    return {
+        "attempt_id": attempt.id,
+        "question_count": question_count or 0,
+        "seconds_per_question": round(per_question, 1) if per_question is not None else None,
+        "baseline_url": baseline_url if proctor_session is not None else None,
+        "status": attempt.status,
+        "started_at": attempt.started_at,
+        "submitted_at": attempt.submitted_at,
+        "total_seconds": total_seconds,
+        "answered": len(rows),
+        "pace": pace,
+        "score": float(attempt.score) if attempt.score is not None else None,
+        "max_score": float(attempt.max_score) if attempt.max_score is not None else None,
+        "graded_at": attempt.graded_at,
+        "released": attempt.results_released_at is not None,
+        "proctored": proctor_session is not None,
+        "integrity_score": integrity,
+        "observations": observations,
+    }

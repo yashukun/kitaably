@@ -6,21 +6,20 @@ import { useCallback, useEffect, useState } from "react";
 import { GlassCard, Eyebrow } from "@/components/glass";
 import { listBooks, type Book } from "@/lib/api/books";
 import {
-  FORMAT_GROUPS,
-  FORMAT_META,
   LEVEL_META,
   RIGOR_META,
   formatLabel,
   type CognitiveLevel,
-  type QuestionFormat,
   type Rigor,
 } from "@/lib/formats";
 import {
+  assessmentSuggestions,
   createAssessment,
   listAssessments,
   type Assessment,
 } from "@/lib/api/assessments";
 import { myAttempts } from "@/lib/api/attempts";
+import { reportContentGap } from "@/lib/api/chat";
 import type { AttemptSummary } from "@/lib/api/assessments";
 import { ApiRequestError } from "@/lib/api/client";
 
@@ -88,6 +87,104 @@ function StatusChip({ status }: { status: Assessment["status"] }) {
   );
 }
 
+/**
+ * Reporting a paper that came back empty.
+ *
+ * The author sees one sentence explaining the failure. What they cannot see — and
+ * what anybody investigating actually needs — is the generation trace: how many calls
+ * were made, how long each took, and whether the model server answered at all. The
+ * server attaches that from the paper's own stored trace when this is filed, so the
+ * report arrives investigable rather than as "generation failed".
+ */
+function ReportFailure({
+  assessmentId,
+  title,
+  error,
+}: {
+  assessmentId: string;
+  title: string;
+  error: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  if (sent) {
+    return (
+      <p className="mt-2 px-1 text-xs text-parchment-dim">
+        Reported — the failure details went with it.
+      </p>
+    );
+  }
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="mt-2 px-1 font-mono text-[11px] text-parchment-dim underline
+                   underline-offset-4 transition hover:text-parchment"
+      >
+        This should have worked — report it
+      </button>
+    );
+  }
+
+  async function send() {
+    setBusy(true);
+    try {
+      await reportContentGap({
+        source: "generation",
+        assessment_id: assessmentId,
+        question: title,
+        book_ids: [],
+        outcome: error.slice(0, 40),
+        note: note.trim() || null,
+      });
+      setSent(true);
+    } catch {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-2 flex flex-col gap-2 rounded-xl border border-parchment/12 p-3">
+      <label className="font-mono text-[11px] text-parchment-dim" htmlFor={`why-${assessmentId}`}>
+        What did you expect? The failure details are attached automatically.
+      </label>
+      <textarea
+        id={`why-${assessmentId}`}
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        rows={2}
+        maxLength={2000}
+        className="field px-3 py-2 text-sm"
+        placeholder="e.g. this book has exercises at the end of every chapter"
+      />
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={send}
+          disabled={busy}
+          className="rounded-xl bg-indigo px-4 py-2 text-xs font-medium transition
+                     hover:bg-indigo/85 disabled:opacity-40"
+        >
+          {busy ? "Sending…" : "Send report"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          className="px-2 font-mono text-[11px] text-parchment-dim hover:text-parchment"
+        >
+          cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
 export function AssessmentList() {
   const [papers, setPapers] = useState<Assessment[] | null>(null);
   const [sat, setSat] = useState<AttemptSummary[] | null>(null);
@@ -97,10 +194,19 @@ export function AssessmentList() {
   const [chosen, setChosen] = useState<string[]>([]);
   // Empty is the default and it means auto. Not a placeholder for a choice the author
   // has not made yet — a choice they were allowed not to make.
-  const [pickedFormats, setPickedFormats] = useState<QuestionFormat[]>([]);
   const [pickedLevels, setPickedLevels] = useState<CognitiveLevel[]>([]);
   const [rigor, setRigor] = useState<Rigor>("medium");
   const [showPicker, setShowPicker] = useState(false);
+  // Controlled, unlike the rest of the form, because a suggestion chip has to be able
+  // to fill them. The cost is that `form.reset()` no longer clears these two, so the
+  // success path below resets them by hand.
+  const [title, setTitle] = useState("");
+  const [focus, setFocus] = useState("");
+  const [hints, setHints] = useState<{
+    key: string;
+    titles: string[];
+    topics: string[];
+  }>({ key: "", titles: [], topics: [] });
 
   const refresh = useCallback(async () => {
     try {
@@ -134,6 +240,28 @@ export function AssessmentList() {
     return () => clearInterval(timer);
   }, [papers, refresh]);
 
+  // Titles and topics for the books that are picked, from their detected chapters.
+  // Keyed by the selection they belong to, so a stale response for a book the author
+  // has since unpicked is discarded rather than rendered.
+  const bookKey = chosen.join(",");
+
+  useEffect(() => {
+    if (!bookKey) return;
+    let cancelled = false;
+    assessmentSuggestions(bookKey.split(","))
+      .then((rows) => {
+        if (!cancelled) setHints({ key: bookKey, ...rows });
+      })
+      .catch(() => {
+        if (!cancelled) setHints({ key: bookKey, titles: [], topics: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bookKey]);
+
+  const suggested = hints.key === bookKey ? hints : { titles: [], topics: [] };
+
   async function create(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -156,18 +284,19 @@ export function AssessmentList() {
       await createAssessment({
         title: String(data.get("title") ?? "").trim() || fallbackTitle,
         source: { book_ids: chosen },
-        type: String(data.get("type") ?? "mixed") as "mcq" | "subjective" | "mixed",
-        formats: pickedFormats,
         levels: pickedLevels,
         rigor,
         instructions: String(data.get("instructions") ?? "").trim() || null,
         question_count: Number(data.get("count") ?? 8),
         duration_minutes: data.get("duration") ? Number(data.get("duration")) : null,
         proctoring_enabled: data.get("proctored") === "on",
+        results_release:
+          data.get("review_first") === "on" ? "on_review" : "immediate",
       });
       form.reset();
+      setTitle("");
+      setFocus("");
       setChosen([]);
-      setPickedFormats([]);
       setPickedLevels([]);
       setRigor("medium");
       setShowPicker(false);
@@ -244,12 +373,52 @@ export function AssessmentList() {
               )}
             </fieldset>
 
+            {/* Suggestions from the books' own chapter titles. One strip above both
+                fields it feeds, so it reads as "here is what is in these books"
+                rather than as two separate features. Nothing renders when a book has
+                no detected outline — inventing a topic would point the paper at
+                material that is not there. */}
+            {(suggested.topics.length > 0 || suggested.titles.length > 0) && (
+              <div className="flex flex-col gap-3 rounded-xl border border-parchment/12 px-4 py-3">
+                {suggested.topics.length > 0 && (
+                  <div>
+                    <p className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
+                      Topics in these books — click to focus on one
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {suggested.topics.map((topic) => (
+                        <Chip key={topic} on={focus === topic} onClick={() => setFocus(topic)}>
+                          {topic}
+                        </Chip>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {suggested.titles.length > 0 && (
+                  <div>
+                    <p className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
+                      Call it
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {suggested.titles.map((name) => (
+                        <Chip key={name} on={title === name} onClick={() => setTitle(name)}>
+                          {name}
+                        </Chip>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             <label className="flex flex-col gap-2">
               <span className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
                 Focus (optional)
               </span>
               <input
                 name="instructions"
+                value={focus}
+                onChange={(event) => setFocus(event.target.value)}
                 maxLength={1000}
                 className="field px-3.5 py-2.5 text-sm"
                 placeholder="A topic or chapters to concentrate on — e.g. photosynthesis, or chapters 3–4"
@@ -267,6 +436,8 @@ export function AssessmentList() {
               </span>
               <input
                 name="title"
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
                 className="field px-3.5 py-2.5 text-sm"
                 placeholder="Named after the book if left blank"
               />
@@ -278,16 +449,6 @@ export function AssessmentList() {
                   Questions
                 </span>
                 <input name="count" type="number" min={1} max={50} defaultValue={8} className="field w-28 px-3.5 py-2.5 text-sm" />
-              </label>
-              <label className="flex flex-col gap-2">
-                <span className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
-                  Kind
-                </span>
-                <select name="type" defaultValue="mixed" className="field px-3.5 py-2.5 text-sm">
-                  <option value="mixed">Mixed</option>
-                  <option value="mcq">Answered by picking</option>
-                  <option value="subjective">Written</option>
-                </select>
               </label>
               <label className="flex flex-col gap-2">
                 <span className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
@@ -325,11 +486,30 @@ export function AssessmentList() {
               </span>
             </label>
 
+            {/* Checked by default, and the default is the point: a mark reaches the
+                person who sat the paper when the author says so. Unchecking it is a
+                deliberate opt-out for a low-stakes quiz, not the path of least
+                resistance. */}
+            <label className="flex items-start gap-2.5">
+              <input
+                name="review_first"
+                type="checkbox"
+                defaultChecked
+                className="mt-0.5 accent-indigo"
+              />
+              <span className="text-sm leading-relaxed text-parchment-dim">
+                <span className="text-parchment">Review results before sitters see them.</span>{" "}
+                You get the marks and the sitting report first; whoever sat it waits
+                until you release. Uncheck to show scores as soon as they are marked.
+              </span>
+            </label>
+
             {/* --------------------------------------------- the picker ---
-                Folded away by default and summarised in one line when it is. An
-                author who wants a quiz gets a quiz; an author who wants a match
-                grid at `evaluate` level can say so. Neither has to see the other's
-                controls. */}
+                Folded away by default and summarised in one line when it is. Every
+                paper is multiple choice (D32), so what is left to choose is what the
+                questions should ask FOR — recall reads very differently from evaluate
+                on the same book. An author who wants a quiz gets a quiz without
+                opening this. */}
             <div className="rounded-xl border border-parchment/12">
               <button
                 type="button"
@@ -338,11 +518,11 @@ export function AssessmentList() {
                 className="flex w-full flex-wrap items-center justify-between gap-3 px-4 py-3 text-left"
               >
                 <span className="text-sm">
-                  Question types
+                  What it should test
                   <span className="ml-2 text-parchment-dim">
-                    {pickedFormats.length === 0
+                    {pickedLevels.length === 0
                       ? "chosen to suit the material"
-                      : pickedFormats.map(formatLabel).join(", ")}
+                      : pickedLevels.map((level) => LEVEL_META[level].label).join(", ")}
                   </span>
                 </span>
                 <span className="font-mono text-[11px] text-parchment-dim">
@@ -354,41 +534,15 @@ export function AssessmentList() {
                 <div className="flex flex-col gap-5 border-t border-parchment/10 px-4 py-4">
                   <p className="text-xs leading-relaxed text-parchment-dim">
                     Pick as many as you like, or none — with none chosen, the paper is
-                    written in whatever mix suits the books you picked. Not every book
-                    supports every type: a novel will not produce a numeric question,
-                    and anything the material cannot support is left out rather than
-                    invented.
+                    spread across recall, understanding and application. Not every book
+                    supports every level: a reference book will not produce much to
+                    evaluate, and anything the material cannot support is left out
+                    rather than invented.
                   </p>
-
-                  {FORMAT_GROUPS.map((group) => (
-                    <fieldset key={group.title}>
-                      <legend className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
-                        {group.title} — {group.hint}
-                      </legend>
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {group.formats.map((format) => (
-                          <Chip
-                            key={format}
-                            on={pickedFormats.includes(format)}
-                            title={FORMAT_META[format].blurb}
-                            onClick={() =>
-                              setPickedFormats((current) =>
-                                current.includes(format)
-                                  ? current.filter((value) => value !== format)
-                                  : [...current, format],
-                              )
-                            }
-                          >
-                            {FORMAT_META[format].label}
-                          </Chip>
-                        ))}
-                      </div>
-                    </fieldset>
-                  ))}
 
                   <fieldset>
                     <legend className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
-                      What it should test — leave blank for a spread
+                      Leave blank for a spread
                     </legend>
                     <div className="mt-2 flex flex-wrap gap-2">
                       {(Object.keys(LEVEL_META) as CognitiveLevel[]).map((level) => (
@@ -410,13 +564,10 @@ export function AssessmentList() {
                     </div>
                   </fieldset>
 
-                  {pickedFormats.length > 0 && (
+                  {pickedLevels.length > 0 && (
                     <button
                       type="button"
-                      onClick={() => {
-                        setPickedFormats([]);
-                        setPickedLevels([]);
-                      }}
+                      onClick={() => setPickedLevels([])}
                       className="self-start font-mono text-[11px] text-parchment-dim underline underline-offset-4 hover:text-parchment"
                     >
                       clear and let the material decide
@@ -486,6 +637,16 @@ export function AssessmentList() {
                   )}
                 </GlassCard>
               </Link>
+              {/* Outside the Link on purpose: a button inside one navigates on click,
+                  and the whole point of this control is that it does not take the
+                  author away from the failure they are reporting. */}
+              {paper.error && (
+                <ReportFailure
+                  assessmentId={paper.id}
+                  title={paper.title}
+                  error={paper.error}
+                />
+              )}
             </li>
           ))}
         </ul>

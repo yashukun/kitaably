@@ -283,3 +283,209 @@ def test_coverage_sample_runs_under_the_same_boundary(principal: Principal) -> N
     # The named books are a narrowing AND-ed onto the scope, exactly as the picker.
     assert "chunks.book_id IN" in rendered
     assert "OR chunks.book_id IN" not in rendered
+
+
+async def _nothing(session, scored):
+    """Stand-in for `_enrich`, which needs a real session to hydrate a hit."""
+    return []
+
+
+# --- the salvage tier changes the index, never the predicate -----------------
+#
+# When the strict search finds nothing, retrieval takes a second look before it
+# refuses (D31). That is the one place in the pipeline that deliberately relaxes a
+# retrieval parameter, so it is the one place worth proving relaxes only the
+# parameter it meant to.
+
+
+async def test_salvage_searches_under_the_callers_own_filter(monkeypatch) -> None:
+    """Both salvage passes get the predicate the strict pass was given.
+
+    A second look that built its own filter — or dropped it, being "only a
+    fallback" — would be a scope bypass reachable from any question the material
+    does not cover, which is to say from any question at all.
+    """
+    from app.services import chat
+
+    seen: list[dict] = []
+
+    async def fake_terms(session, question, scope_filter, **kwargs):
+        seen.append({"kind": "terms", "scope": scope_filter, **kwargs})
+        return ["sphincter"]
+
+    async def fake_corroborated(session, vector, terms, scope_filter, **kwargs):
+        seen.append({"kind": "corroborated", "scope": scope_filter, **kwargs})
+        return []
+
+    monkeypatch.setattr(chat, "significant_terms", fake_terms)
+    monkeypatch.setattr(chat, "search_chunks_corroborated", fake_corroborated)
+
+    scope = build_retrieval_filter(ALICE)
+    assert await chat._salvage(None, "sphincter", [0.0] * 384, scope, book_ids=None) == []
+
+    assert [call["kind"] for call in seen] == ["terms", "corroborated"]
+    for call in seen:
+        # The identical predicate object, not a rebuilt equivalent.
+        assert call["scope"] is scope
+        assert uid(ALICE.id) in sql(call["scope"])
+
+
+async def test_salvage_relaxes_only_the_corroboration_ceiling(monkeypatch) -> None:
+    """The one number that moves, and it is not a retrieval ceiling.
+
+    Measured, ``bge-small-en-v1.5`` scores questions the book has nothing on at
+    0.36–0.45 and questions it covers well at 0.17–0.29 — the bands touch, so no
+    wider SEARCH can separate them. This ceiling is applied to passages the
+    reader's own words already named, where the same scoring does separate
+    cleanly (0.36–0.38 against 0.46–0.61).
+    """
+    from app.core.config import settings
+    from app.services import chat
+
+    seen: list[dict] = []
+
+    async def fake_terms(session, question, scope_filter, **kwargs):
+        return ["sphincter"]
+
+    async def fake_corroborated(session, vector, terms, scope_filter, **kwargs):
+        seen.append(kwargs)
+        return []
+
+    monkeypatch.setattr(chat, "significant_terms", fake_terms)
+    monkeypatch.setattr(chat, "search_chunks_corroborated", fake_corroborated)
+
+    await chat._salvage(
+        None, "sphincter", [0.0] * 384, build_retrieval_filter(ALICE), book_ids=None
+    )
+
+    assert seen[0]["max_distance"] == settings.retrieval_salvage_distance
+    assert settings.retrieval_salvage_distance > settings.retrieval_max_distance
+
+
+async def test_salvage_reuses_the_query_vector(monkeypatch) -> None:
+    """No second embedding. The question is a poor retriever here and a perfectly
+    good comparator, which is the whole trick — and it costs nothing extra."""
+    from app.services import chat
+
+    vector = [0.5] * 384
+    seen: list[list[float]] = []
+
+    async def fake_terms(session, question, scope_filter, **kwargs):
+        return ["sphincter"]
+
+    async def fake_corroborated(session, query_vector, terms, scope_filter, **kwargs):
+        seen.append(query_vector)
+        return []
+
+    async def unexpected_embed(text):
+        raise AssertionError("the salvage must not embed a second time")
+
+    monkeypatch.setattr(chat, "significant_terms", fake_terms)
+    monkeypatch.setattr(chat, "search_chunks_corroborated", fake_corroborated)
+    monkeypatch.setattr(chat.embeddings, "embed_query", unexpected_embed)
+
+    await chat._salvage(
+        None, "sphincter", vector, build_retrieval_filter(ALICE), book_ids=None
+    )
+
+    assert seen == [vector]
+
+
+async def test_salvage_narrowing_still_only_subtracts(monkeypatch) -> None:
+    """`book_ids` reaches every pass, so a reader's book selection is honoured on
+    the fallback path exactly as it is on the first one."""
+    from app.services import chat
+
+    chosen = [uuid4()]
+    seen: list[list | None] = []
+
+    async def fake_terms(session, question, scope_filter, **kwargs):
+        seen.append(kwargs.get("book_ids"))
+        return ["sphincter"]
+
+    async def fake_corroborated(session, vector, terms, scope_filter, **kwargs):
+        seen.append(kwargs.get("book_ids"))
+        return []
+
+    monkeypatch.setattr(chat, "significant_terms", fake_terms)
+    monkeypatch.setattr(chat, "search_chunks_corroborated", fake_corroborated)
+
+    await chat._salvage(
+        None, "sphincter", [0.0] * 384, build_retrieval_filter(ALICE), book_ids=chosen
+    )
+
+    assert seen == [chosen, chosen]
+
+
+async def test_salvage_stops_when_the_corpus_knows_none_of_the_words(monkeypatch) -> None:
+    """No selective word means nothing to look up, and nothing else runs."""
+    from app.services import chat
+
+    ran: list[str] = []
+
+    async def no_terms(session, question, scope_filter, **kwargs):
+        return []
+
+    async def fake_corroborated(*args, **kwargs):
+        ran.append("corroborated")
+        return []
+
+    monkeypatch.setattr(chat, "significant_terms", no_terms)
+    monkeypatch.setattr(chat, "search_chunks_corroborated", fake_corroborated)
+
+    result = await chat._salvage(
+        None, "the offside rule", [0.0] * 384, build_retrieval_filter(ALICE), book_ids=None
+    )
+
+    assert result == []
+    assert ran == []
+
+
+async def test_a_word_the_book_merely_contains_is_not_coverage(monkeypatch) -> None:
+    """"What were the causes of the French Revolution" keeps "french", which a
+    chemistry passage happens to use. Scored against the question that passage is
+    at 0.531 — outside the ceiling — so the refusal stands."""
+    from app.services import chat
+
+    async def fake_terms(session, question, scope_filter, **kwargs):
+        return ["french"]
+
+    async def nothing_survived(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(chat, "significant_terms", fake_terms)
+    monkeypatch.setattr(chat, "search_chunks_corroborated", nothing_survived)
+
+    assert (
+        await chat._salvage(
+            None,
+            "what were the causes of the french revolution",
+            [0.0] * 384,
+            build_retrieval_filter(ALICE),
+            book_ids=None,
+        )
+        == []
+    )
+
+
+async def test_an_empty_salvage_is_still_a_refusal(monkeypatch) -> None:
+    """The refusal did not go away — it moved behind a second look.
+
+    "Nothing within 0.35 for the sentence as typed" and "the material does not
+    cover this" are different statements, and only the second is worth telling a
+    reader. When the second look comes back empty the second statement is true,
+    and it is still made with no model call at all (CLAUDE.md invariant 5).
+    """
+    from app.services import chat
+
+    async def nothing(*args, **kwargs):
+        return []
+
+    async def fake_embed(text):
+        return [0.0] * 384
+
+    monkeypatch.setattr(chat, "search_chunks", nothing)
+    monkeypatch.setattr(chat, "significant_terms", nothing)
+    monkeypatch.setattr(chat.embeddings, "embed_query", fake_embed)
+
+    assert await chat.retrieve_for(None, ALICE, "quantum chromodynamics") == []

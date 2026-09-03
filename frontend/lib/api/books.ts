@@ -106,3 +106,14 @@ export const retryBook = (id: string) =>
 
 export const deleteBook = (id: string) =>
   api<{ id: string; status: BookStatus }>(`/books/${id}`, { method: "DELETE" });
+
+
+/**
+ * Questions worth asking about this book, for the empty chat screen.
+ *
+ * May come back empty, and that is an answer rather than a failure: a novel with no
+ * printed exercises and no detected outline has nothing honest to suggest, and an
+ * empty strip beats an invented question that leads straight to a refusal.
+ */
+export const bookSuggestions = (bookId: string) =>
+  api<string[]>(`/books/${bookId}/suggestions`);

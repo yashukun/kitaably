@@ -266,3 +266,76 @@ def test_the_title_rides_single_book_resolution() -> None:
     """With several books visible, "the title" is as ambiguous as "this book" —
     it asks which, rather than averaging the library."""
     assert classify("what is the title about?").single_book is True
+
+
+# --- the brief: the book's own table of contents -----------------------------
+#
+# The question that sent this whole family to a refusal: the chapter list is
+# `public.chapters`, written at ingest, and no passage contains it. Measured on
+# the NCERT Science 10th upload, "how many chapters does this book have" has its
+# nearest passage at cosine distance 0.43 against a 0.35 ceiling — so the tutor
+# refused about fifteen rows it was holding.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "how many chapter does this book have what are the names?",
+        "How many chapters does this book have?",
+        "What are the chapter names?",
+        "What are the chapter titles?",
+        "List the chapters",
+        "list all the chapters",
+        "Give me the chapter titles.",
+        "Show me its chapters",
+        "Names of all the chapters",
+        "Table of contents",
+        "toc",
+        "What chapters are in this book?",
+        "chapter names",
+    ],
+    ids=repr,
+)
+def test_chapter_list_questions_are_metadata(text: str) -> None:
+    profile = classify(text)
+    assert profile.shape is QueryShape.METADATA
+    assert profile.fact == "chapters"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "which chapters discuss photosynthesis",
+        "what chapters cover acids and bases",
+        "which chapters mention the krebs cycle",
+        "what sections talk about enthalpy",
+    ],
+    ids=repr,
+)
+def test_a_chapter_question_with_a_subject_is_a_lookup(text: str) -> None:
+    """The reader wants the passages, not the outline.
+
+    This is the boundary the record answer must not cross. "Which chapters
+    discuss X" names a subject, and answering it with a table of contents would
+    be a confidently wrong answer to a question the search path handles well.
+    """
+    assert classify(text).shape is LOOKUP
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "which chapters should I read",
+        "what are the most important chapters",
+        "which chapters are the most important",
+    ],
+    ids=repr,
+)
+def test_chapter_advice_questions_stay_overviews(text: str) -> None:
+    """"Which should I read" is a judgement about the material, not its index."""
+    assert classify(text).shape is OVERVIEW
+
+
+def test_a_chapter_question_points_at_one_book() -> None:
+    """So it rides the same single-book resolution as "who wrote this book"."""
+    assert classify("how many chapters does this book have?").single_book is True

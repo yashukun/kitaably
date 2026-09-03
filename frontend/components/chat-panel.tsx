@@ -7,7 +7,7 @@ import { GlassCard, Eyebrow } from "@/components/glass";
 import { PipelineDetails } from "@/components/pipeline-details";
 import { ScopeChip } from "@/components/scope-chip";
 import { TutorAnswer } from "@/components/tutor-answer";
-import { listBooks, type Book } from "@/lib/api/books";
+import { bookSuggestions, listBooks, type Book } from "@/lib/api/books";
 import {
   askQuestion,
   createChatSession,
@@ -19,7 +19,10 @@ import {
   type Citation,
   type ExportFormat,
   type Intent,
+  type Outcome,
   type Pipeline,
+  REPORTABLE,
+  reportContentGap,
 } from "@/lib/api/chat";
 import { ApiRequestError } from "@/lib/api/client";
 
@@ -34,6 +37,17 @@ type Bubble = {
   /** What ran behind this answer. Only live turns carry one — the trace rides the
    *  stream and is not persisted, so reloaded history has nothing to disclose. */
   pipeline?: Pipeline;
+  /** How the turn ended, from the persisted column. Unlike `pipeline` this survives a
+   *  reload, which is the whole reason it is stored: a refusal has to still be
+   *  reportable after somebody refreshes on their way to go check the book. */
+  outcome?: Outcome | null;
+  /** The row id, once there is one. Null while streaming — the assistant's message is
+   *  filed after the last token, so a report sent mid-answer has nothing to point at
+   *  and says so rather than inventing a link. */
+  messageId?: string | null;
+  /** What was asked, kept beside the answer so a report can carry it without walking
+   *  back up the transcript. */
+  asked?: string;
   /** Streaming time from the `done` event, for the disclosure's footer. */
   elapsedMs?: number;
 };
@@ -220,6 +234,112 @@ function BookPicker({
   );
 }
 
+/**
+ * The answer to a refusal.
+ *
+ * The tutor saying "your books don't cover this" is correct behaviour and it is also
+ * a dead end: until now the reader had nowhere to say "they do — it's in chapter 4".
+ * This is that. It goes to the owner of the book, who is the only person who can act
+ * on it, and it is stored rather than logged for exactly that reason.
+ *
+ * The copy asks about the MATERIAL, not about the tutor. "Rate this answer" invites a
+ * verdict on a machine; "is this in your book" invites the one fact that is actually
+ * useful and that only the reader has.
+ */
+function ReportGap({
+  question,
+  messageId,
+  outcome,
+  bookIds,
+}: {
+  question: string;
+  messageId: string | null;
+  outcome: Outcome;
+  bookIds: string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  if (sent) {
+    return (
+      <p className="mt-4 border-t border-parchment/10 pt-3 text-xs text-parchment-dim">
+        Thanks — whoever owns this book can see it now.
+      </p>
+    );
+  }
+
+  if (!open) {
+    return (
+      <div className="mt-4 border-t border-parchment/10 pt-3">
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="font-mono text-[11px] text-parchment-dim underline underline-offset-4
+                     transition hover:text-parchment"
+        >
+          Is this in your book? Tell us where
+        </button>
+      </div>
+    );
+  }
+
+  async function send() {
+    setBusy(true);
+    try {
+      await reportContentGap({
+        message_id: messageId,
+        question,
+        book_ids: bookIds,
+        outcome,
+        note: note.trim() || null,
+      });
+      setSent(true);
+    } catch {
+      // Deliberately quiet. A failed report is worth one retry by the reader, not an
+      // error banner over an answer they are still reading.
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-4 flex flex-col gap-2 border-t border-parchment/10 pt-3">
+      <label className="font-mono text-[11px] text-parchment-dim" htmlFor="gap-note">
+        Where is it? A chapter or a page is enough.
+      </label>
+      <textarea
+        id="gap-note"
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        rows={2}
+        maxLength={2000}
+        className="field px-3 py-2 text-sm"
+        placeholder="e.g. chapter 4, the section on alloys"
+      />
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={send}
+          disabled={busy}
+          className="rounded-xl bg-indigo px-4 py-2 text-xs font-medium transition
+                     hover:bg-indigo/85 disabled:opacity-40"
+        >
+          {busy ? "Sending…" : "Send"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          className="px-2 font-mono text-[11px] text-parchment-dim hover:text-parchment"
+        >
+          cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
 export function ChatPanel() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -231,8 +351,12 @@ export function ChatPanel() {
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [suggested, setSuggested] = useState<{ bookId: string; items: string[] } | null>(
+    null,
+  );
 
   const endRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   // React runs effects twice in development. Without this guard the second pass
   // creates a second empty conversation on every first visit.
   const started = useRef(false);
@@ -282,6 +406,8 @@ export function ChatPanel() {
             content: row.content,
             citations: row.citations,
             intent: row.intent,
+            outcome: row.outcome,
+            messageId: row.id,
           })),
         );
       } catch (caught) {
@@ -320,6 +446,40 @@ export function ChatPanel() {
     }
   }
 
+  // Suggestions, for the blank screen. One book only: with several picked there is no
+  // single outline to draw on, and with none the library is the whole shelf — neither
+  // produces a suggestion worth the width. Failures are swallowed on purpose; a
+  // suggestion strip that cannot load is a strip that is not there, which is exactly
+  // what the empty state already looks like.
+  const onlyBook = selected.size === 1 ? [...selected][0] : null;
+
+  useEffect(() => {
+    if (!onlyBook) return;
+    let cancelled = false;
+    bookSuggestions(onlyBook)
+      .then((rows) => {
+        if (!cancelled) setSuggested({ bookId: onlyBook, items: rows });
+      })
+      .catch(() => {
+        if (!cancelled) setSuggested({ bookId: onlyBook, items: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onlyBook]);
+
+  // Keyed by the book they were fetched for, and read back only when that is still the
+  // book in scope. Deriving the match rather than clearing on change is what keeps the
+  // strip from flashing the previous book's questions for a frame after a switch.
+  const suggestions = suggested?.bookId === onlyBook ? suggested.items : [];
+
+  function fillWithSuggestion(text: string) {
+    // Filled, not sent. The reader should be able to edit it into their own words —
+    // and a click that fires off a question is a click somebody makes by accident.
+    setQuestion(text);
+    inputRef.current?.focus();
+  }
+
   async function ask(event: React.FormEvent) {
     event.preventDefault();
     const text = question.trim();
@@ -341,6 +501,7 @@ export function ChatPanel() {
         citations: [],
         intent: null,
         streaming: true,
+        asked: text,
       },
     ]);
 
@@ -357,7 +518,10 @@ export function ChatPanel() {
         text,
         {
           onIntent: (intent) => patch({ intent }),
-          onPipeline: (pipeline) => patch({ pipeline }),
+          // The live copy of what the persisted column will hold. Mirrored onto the
+          // bubble so the report control reads one field whether the turn just
+          // happened or came back from the transcript.
+          onPipeline: (pipeline) => patch({ pipeline, outcome: pipeline.outcome }),
           onCitations: (citations) => patch({ citations }),
           onToken: (token) =>
             setBubbles((current) =>
@@ -417,6 +581,32 @@ export function ChatPanel() {
               Every answer names the pages it came from. If your books don&apos;t cover
               something, Kitaably says so instead of guessing.
             </p>
+
+            {/* The book's own questions, where it prints any. Nothing is rendered when
+                there is nothing honest to offer — an empty strip is the correct answer
+                for a novel, and better than a made-up question that would only earn a
+                refusal. */}
+            {suggestions.length > 0 && (
+              <div className="mt-5">
+                <p className="font-mono text-[11px] font-medium tracking-[0.02em] text-parchment-dim">
+                  From this book
+                </p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {suggestions.map((text) => (
+                    <button
+                      key={text}
+                      type="button"
+                      onClick={() => fillWithSuggestion(text)}
+                      className="rounded-xl border border-parchment/15 px-3 py-2 text-left text-xs
+                                 leading-relaxed text-parchment/90 transition
+                                 hover:border-indigo/50 hover:bg-indigo/10"
+                    >
+                      {text}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </GlassCard>
         )}
 
@@ -471,6 +661,15 @@ export function ChatPanel() {
                     </p>
                   )}
                   <Slips id={bubble.key} citations={bubble.citations} />
+                  {!bubble.streaming && bubble.outcome &&
+                    REPORTABLE.includes(bubble.outcome) && (
+                      <ReportGap
+                        question={bubble.asked ?? ""}
+                        messageId={bubble.messageId ?? null}
+                        outcome={bubble.outcome}
+                        bookIds={[...selected]}
+                      />
+                    )}
                 </GlassCard>
               </li>
             ),
@@ -485,6 +684,7 @@ export function ChatPanel() {
           <div className="composer relative flex flex-col gap-2 p-2.5">
             <div className="flex items-center gap-3">
               <input
+                ref={inputRef}
                 value={question}
                 onChange={(event) => setQuestion(event.target.value)}
                 disabled={!sessionId || sending}

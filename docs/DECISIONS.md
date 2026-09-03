@@ -1105,3 +1105,182 @@ rule 2 removes the cause; repairing the symptom would blur "parsed" and "patched
 **Reversal.** Each rule reverses independently: put `rationale` back in the shapes,
 delete the cap from `ask()`, move the dedupe back after the loop, reorder the prompt.
 Nothing in the schema or the stored rows depends on any of them.
+
+---
+
+## D31 — A refusal means the second look also found nothing
+
+**Context.** A reader asked *"how many chapter does this book have what are the
+names?"* of a 232-page science textbook and got *"Your books don't cover this."*
+The chapter list was fifteen rows in `public.chapters`, written at ingest, in the
+same transaction the refusal was composed in.
+
+That was one bug (the shape router had no route for it, fixed below), but chasing
+it surfaced the general one: `retrieve_for` treated *"nothing within
+`RETRIEVAL_MAX_DISTANCE` for the sentence as typed"* as though it meant *"this
+material does not cover the question"*. Those are different statements, and the
+tutor was making the second on the evidence of the first.
+
+**What was measured.** Against the NCERT Science 10th upload (496 chunks,
+`bge-small-en-v1.5`), cosine distance to the nearest passage:
+
+| question | distance |
+|---|---|
+| "What is a balanced chemical equation?" | 0.170 |
+| "how does the human eye work" | 0.199 |
+| "what are acids and bases" | 0.230 |
+| **the strict ceiling** | **0.35** |
+| "explain how a nuclear reactor produces power" | 0.356 |
+| "explain quantum entanglement" | 0.374 |
+| "what is the offside rule in football" | 0.409 |
+| "what were the causes of the French Revolution" | 0.452 |
+| "who is Virat Kohli" | 0.523 |
+
+**There is no gap.** The obvious repair — a second, wider distance ceiling — was
+implemented, measured, and abandoned: any ceiling loose enough to rescue a
+half-covered question also admits the offside rule and Virat Kohli. Distance
+cannot separate *barely covered* from *not covered* on this model, so it is not
+asked to.
+
+**What actually fails** is the query, not the threshold. *"Honestly I keep
+forgetting, what does the sphincter muscle do before my test tomorrow"* embeds to
+noise because thirteen of its sixteen words are throat-clearing — while the book
+answers it on two pages. So the second look swaps which index does the finding:
+
+1. `rag/retrieve.py :: significant_terms` asks the full-text index which of the
+   reader's own words actually single something out in scope. Words the material
+   has never heard of are **dropped, not required** — a word the book does not
+   contain is evidence about phrasing, not about coverage. Words it contains
+   everywhere are dropped too, both absolutely (>2% of chunks) and relative to the
+   rarest word present, because "keep" (28 chunks) and "test" (50) say nothing
+   about which passage to open while "sphincter" (2) says everything.
+2. `rag/retrieve.py :: search_chunks_corroborated` looks those words up — ORed,
+   high recall — and scores every passage they name against **the question as the
+   reader typed it**, keeping only what lands inside `RETRIEVAL_SALVAGE_DISTANCE`.
+
+The insight the second step rests on: *a noisy question is a poor retriever and
+still a perfectly good comparator.* Scored that way the bands separate cleanly:
+
+| the passage naming… | distance to the full question | |
+|---|---|---|
+| "tyndall" | 0.360 | the answer |
+| "solenoid" | 0.374 | the answer |
+| "sphincter" | 0.381 | the answer |
+| "confusing" | 0.463 | coincidence |
+| "french" | 0.531 | coincidence |
+| "kohli" | 0.608 | coincidence |
+
+`RETRIEVAL_SALVAGE_DISTANCE` (0.42) sits in that gap. It is safe at a width that
+would be reckless as a search ceiling **only because nothing reaches it that the
+reader's own words did not name** — widening the ordinary search to 0.42 would put
+the Kohli passage into unrelated answers; here it cannot.
+
+**What did not change.** Grounding. Every passage returned is still a real chunk
+the caller may lawfully read, under the same `build_retrieval_filter` predicate
+passed straight through to both passes; there is still no world-knowledge
+fallback; and when the second look is empty the refusal happens exactly as before,
+with no model call (CLAUDE.md invariant 5). Salvaged hits are marked `loose`, and
+the tutor is told its evidence is weak and to say so — trading a false refusal for
+a confident wrong answer would be a worse product, not a better one.
+
+**Landing alongside it**, from the same investigation:
+
+* **Structural questions have a route.** `rag/shape.py` gained a `chapters` fact,
+  answered from `public.chapters` with no search and no model call — the same
+  argument as `author` and `pages` (D19), which chapters were simply missed by.
+  "Which chapters discuss photosynthesis" stays a LOOKUP; "which should I read"
+  stays an OVERVIEW.
+* **ZIP part titles are read off the page.** A zip of per-chapter PDFs with no
+  outlines took its chapter titles from member filenames, so the NCERT upload's
+  table of contents read `jesc101 … jesc113`. `rag/chunk.py` now looks for a
+  heading at the top of each part's first page before falling back to the
+  filename, recovering 12 of 15 (the other three are front matter and an answer
+  key, which have none). **Boundaries are untouched** — the seams are still the
+  uploaded files. Only the label changes, which is why this is allowed to be a
+  heuristic at all where `detect_chapters` is not.
+* **`rank.dedupe` collapses identical passages across books.** It required both
+  hits to come from the same book, so one textbook uploaded twice filled the
+  source budget twice: five sources showed two or three distinct passages, and the
+  dominance vote split 50/50 between the copies so `route` could never fire. Safe
+  to cross books because `_overlaps` tests for a *verbatim* shared span, not
+  similarity — two different books trip it only by carrying the same text, which
+  is padding rather than corroboration.
+* **`rank.vote` tolerates a hit with no distance.** Lexical hits carry a `ts_rank`,
+  not a cosine distance; `float(None)` crashed the moment the salvage began fusing
+  them into the focused path.
+
+**Cost.** Two indexed queries and no model call, on a path that previously
+returned a refusal. No second embedding — the query vector is reused as the
+comparator. Measured 50–115 ms for a salvaged turn end to end.
+
+**Reversal.** Delete `_salvage` and its two `retrieve.py` functions and
+`retrieve_for` returns to refusing on an empty first pass; the shape route, the
+title recovery and the dedupe change are independent of it and of each other.
+
+**What this does not fix.** A question whose subject never appears in the material
+in any form the reader typed still refuses, correctly. And a genuinely
+conversational question whose topic words are all common ("how does this stuff
+work") has no selective term to look up — the honest repair for that is query
+condensation, which D21 declined on CPU-latency grounds and which this does not
+revisit.
+
+## D32 — One question format, and marking becomes arithmetic
+
+**The measurement that forced it.** Generation was unusable at the keyboard, and the
+cause was structural rather than a bad model. Auto drew from a mix of four formats, and
+`generate_questions` makes **at least one LLM call per format** — the batching is
+per-format deliberately (D25: asking a 3B model for a true/false, a match grid and a long
+answer in one reply produces three JSON shapes in one object, and it gets that wrong far
+more often than it gets three separate calls wrong). On CPU-only Ollama a call is one to
+two minutes. So the format count *is* the wall clock, and `ASSESSMENT_MAX_LLM_CALLS=12`
+was a budget spent four ways before backfill even started.
+
+**Choice.** Fourteen formats and six grading families collapse to one of each: `mcq`.
+Deleted, not hidden — the enum values are gone from Postgres, not merely unselectable.
+
+**Why deletion rather than restriction.** A `CHECK (format = 'mcq')` would have been a
+smaller diff and is what D25's "reversal" paragraph anticipated. It was rejected because
+it leaves thirteen values reachable and defends them with one line: any future migration,
+psql session, or stale application binary can still write `short_answer` into a column
+whose renderer, validator and grader no longer exist. Postgres has no
+`ALTER TYPE … DROP VALUE`, so the deletion costs a create-rename-convert-drop dance
+(`20260902120000_mcq_only.sql`) — and the narrowed type must end up carrying the
+*original* name, because a stale enum name does not fail on SELECT. It fails the first
+time the column is bound as a parameter, which is the bug `tests/test_enum_names.py` was
+written for after it already happened once to `profiles.role`.
+
+**What this costs, stated plainly.** It is the expensive direction and D25 said so: a
+*format* is cheap to retire, a *family* is not, because a family owns answers already
+stored. Every non-MCQ question is deleted, and `answers.question_id` is
+`ON DELETE CASCADE`, so those answers go with them. The migration therefore copies each
+retired row to `public.retired_questions` first — text columns rather than enum columns,
+since the values they hold are the ones being dropped; RLS on with no grant and no
+policy, so only the service role reaches it; and no FK to `assessments`, so the archive
+outlives a deleted paper. Any draft or published paper that lost a question is then
+**closed**, because its `max_score` was frozen at publish and no longer matches the sum
+of its questions. Marks already awarded are left exactly as they were: they are
+historical facts about a paper that existed.
+
+**A consequence worth naming: grading no longer calls an LLM at all.** `grade_subjective`
+was the only one, so a submitted paper is now marked in milliseconds instead of queueing
+behind generation for the single-slot Ollama. `grade_answer` also loses its fallthrough —
+with the dispatch total over `QuestionType`, a family with no grader raises rather than
+being marked approximately by a default nobody chose.
+
+**What survives, and why it is not an oversight.** `Difficulty` (Bloom's six) and
+`assessment_rigor` (nine) both stay: neither is a format, and together they are what keeps
+one format from meaning one kind of question. "Identify the logical fallacy" is a multiple
+choice at `evaluate`; "design a solution" is out of reach now, and that is the real loss.
+`assessments.type` (mcq/subjective/mixed) also stays, deliberately — unlike
+`questions.format`, nothing dispatches on it, it is baked into the return signature of
+`public.assessment_by_share_token`, and an old paper genuinely *was* mixed. Narrowing it
+would rewrite history to buy tidiness. `app/rag/formats.py` survives the collapse to one
+entry rather than being inlined: the registry is what made this a small diff, and it is
+what would make a fifteenth format small again.
+
+**Reversal.** Expensive, and asymmetric with how cheap it was to arrive here. Re-adding a
+format means a spec, a prompt fragment, a validator branch, a grader, a renderer, a
+migration adding the enum value back, and a branch in `questions_format_matches_family`.
+Re-adding a *family* additionally means deciding what happens to the archived rows in
+`retired_questions`, which no longer join to anything. Adding a seventh family should be
+as reluctant a decision as D25 said it was.

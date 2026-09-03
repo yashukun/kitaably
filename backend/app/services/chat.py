@@ -60,7 +60,9 @@ from app.rag.retrieve import (
     build_retrieval_filter,
     fetch_coverage_chunks,
     search_chunks,
+    search_chunks_corroborated,
     search_chunks_lexical,
+    significant_terms,
 )
 from app.rag.shape import QueryProfile, QueryShape
 from app.rag.shape import classify as classify_shape
@@ -400,9 +402,17 @@ async def prepare_turn(
         _step(steps, watch, "route", "no matching record — content search instead")
 
     hits = await retrieve_for(session, principal, query, book_ids=book_ids)
+    loose = bool(hits) and all(hit.get("loose") for hit in hits)
     _step(
         steps, watch, "search",
-        f"vector · {len(hits)} candidate(s) within {settings.retrieval_max_distance}",
+        f"vector · {len(hits)} candidate(s) within {settings.retrieval_max_distance}"
+        if not loose
+        else (
+            f"nothing within {settings.retrieval_max_distance} as asked; "
+            f"\u201c{_clip(' '.join(hits[0].get('matched_terms') or []), 40)}\u201d "
+            f"\u2192 {len(hits)} loose match(es) within "
+            f"{settings.retrieval_salvage_distance}"
+        ),
     )
 
     if not hits:
@@ -445,9 +455,14 @@ async def prepare_turn(
         votes=votes,
         kind=kept[0]["kind"] if kept else None,
         history=history,
+        # Only when every source came from the salvage tier. A single strict hit
+        # among them means the question was answered, not scraped together, and
+        # telling the model to hedge would make a good answer sound unsure.
+        task=prompts.loose_match_task() if loose else None,
         trace=_trace(
             detected, profile, steps,
-            outcome="answered", query=condensed, sources=len(kept),
+            outcome="loose" if loose else "answered",
+            query=condensed, sources=len(kept),
             books=[
                 {"title": v.title, "chunks": v.chunks, "share": round(v.share, 2)}
                 for v in votes[:6]
@@ -684,6 +699,12 @@ async def _prepare_metadata(
                 ),
             )
 
+    if profile.fact == "chapters":
+        return await _chapters_turn(
+            session, detected, content, query, history, profile, targets,
+            steps=steps, watch=watch,
+        )
+
     _step(
         steps, watch, "record",
         f"{profile.fact or 'title'} · {len(targets)} book(s) · from the library "
@@ -708,6 +729,81 @@ async def _prepare_metadata(
         trace=_trace(
             detected, profile, steps,
             outcome="book_facts", topic=profile.topic,
+            books=[{"title": book.title} for book in targets[:6]],
+        ),
+    )
+
+
+async def _chapters_turn(
+    session: AsyncSession,
+    detected: MessageIntent,
+    content: str,
+    query: str,
+    history: list[prompts.Message],
+    profile: QueryProfile,
+    targets: list[Book],
+    *,
+    steps: list[dict[str, Any]],
+    watch: _Stopwatch,
+) -> Turn:
+    """"How many chapters, and what are they called?" — from ``chapters``.
+
+    The one metadata fact that is not a ``books`` column. It is still the same
+    kind of fact: rows this transaction can read, holding an answer no passage
+    contains, which the focused path used to refuse about (see
+    ``prompts.chapters_reply``).
+
+    A book's synthetic whole-document chapter is filtered out here rather than
+    reported as chapter one. ``rag/chunk.py`` emits exactly one untitled-ish
+    chapter spanning the whole book when the upload carried no outline it could
+    trust, and listing that back as "1. Full document" would dress an absence up
+    as structure.
+    """
+    rows = list(
+        await session.scalars(
+            select(Chapter)
+            .where(Chapter.book_id.in_([book.id for book in targets]))
+            .order_by(Chapter.book_id, Chapter.index)
+        )
+    )
+    by_book: dict[UUID, list[Chapter]] = {}
+    for chapter in rows:
+        by_book.setdefault(chapter.book_id, []).append(chapter)
+
+    listed: list[dict[str, Any]] = []
+    for book in targets:
+        chapters = by_book.get(book.id, [])
+        # One chapter is the whole-document fallback, not a table of contents.
+        real = chapters if len(chapters) > 1 else []
+        listed.append(
+            {
+                "title": book.title,
+                "pages": book.page_count,
+                "chapters": [
+                    {
+                        "title": chapter.title,
+                        "page_start": chapter.page_start,
+                        "page_end": chapter.page_end,
+                    }
+                    for chapter in real
+                ],
+            }
+        )
+
+    found = sum(len(book["chapters"]) for book in listed)
+    _step(
+        steps, watch, "record",
+        f"chapters · {found} across {len(targets)} book(s) · from the library "
+        "record, no search",
+    )
+    return Turn(
+        intent=detected,
+        asked=content,
+        query=query,
+        history=history,
+        answer=prompts.chapters_reply(listed),
+        trace=_trace(
+            detected, profile, steps, outcome="book_facts",
             books=[{"title": book.title} for book in targets[:6]],
         ),
     )
@@ -992,6 +1088,7 @@ async def _prepare_compare(
                 ),
             )
 
+        compare_loose = all(hit.get("loose") for hit in hits)
         deduped = rank.dedupe(hits)
         votes = rank.vote(deduped)
         chosen = [vote.book_id for vote in votes[: settings.chat_multibook_max]]
@@ -1029,10 +1126,15 @@ async def _prepare_compare(
             votes=votes,
             kind=None,
             history=history,
-            task=prompts.compare_task(listed, topic=profile.topic),
+            # A comparison drawn entirely from salvaged passages still has to say
+            # so: the shape block tells the model what its sources ARE, and
+            # "loose" is part of what they are.
+            task=prompts.compare_task(listed, topic=profile.topic)
+            + (" " + prompts.loose_match_task() if compare_loose else ""),
             trace=_trace(
                 detected, profile, steps,
-                outcome="answered", topic=profile.topic, sources=len(kept),
+                outcome="loose" if compare_loose else "answered",
+                topic=profile.topic, sources=len(kept),
                 books=[
                     {"title": v.title, "chunks": v.chunks, "share": round(v.share, 2)}
                     for v in votes[:6]
@@ -1130,24 +1232,116 @@ async def retrieve_for(
     More candidates are fetched than will be kept. Chunk overlap means the top eight
     raw hits are routinely four passages shown twice, so dedupe, the book vote and
     page spread all need room to work; the caller trims with ``rank.narrow``.
+
+    **Two tiers, and only the second one's silence is a refusal** (DECISIONS.md
+    D31). The first pass is the strict cosine search this always was. When it
+    comes back empty the question goes to :func:`_salvage`, which looks the
+    reader's own selective words up in the full-text index and checks the passages
+    they name against the question — because "nothing within 0.35 for the sentence
+    as typed" and "this material does not cover it" are not the same statement,
+    and the tutor was making the second one on the evidence of the first.
+
+    Salvaged hits are marked ``loose`` so the caller can tell the model its
+    evidence is weaker (``prompts.loose_match_task``). That marking is the whole
+    reason this is a second tier rather than a change to the first one: a question
+    that searched well is never sent down it, so a good answer is never diluted.
+
+    Grounding is unchanged. Every returned passage is still a real chunk the
+    caller may lawfully read, under the same predicate; there is still no
+    world-knowledge fallback; and an empty return still means a refusal with no
+    model call (CLAUDE.md invariant 5). What changed is how hard the server looks
+    before saying so.
     """
     query_vector = await embeddings.embed_query(question)
+    scope = build_retrieval_filter(principal)
 
     hits = await search_chunks(
         session,
         query_vector,
-        build_retrieval_filter(principal),
+        scope,
         top_k=settings.retrieval_candidate_k,
         max_distance=settings.retrieval_max_distance,
         book_ids=book_ids,
     )
 
-    if not hits:
+    if hits:
+        retrieval_results_total.inc()
+        return await _enrich(session, hits)
+
+    salvaged = await _salvage(session, question, query_vector, scope, book_ids=book_ids)
+    if not salvaged:
         retrieval_refusals_total.inc()
         return []
 
     retrieval_results_total.inc()
-    return await _enrich(session, hits)
+    return salvaged
+
+
+async def _salvage(
+    session: AsyncSession,
+    question: str,
+    query_vector: list[float],
+    scope: Any,
+    *,
+    book_ids: list[UUID] | None,
+) -> list[dict[str, Any]]:
+    """The second look, run only when the strict search found nothing.
+
+    **It does not lower the bar; it changes which index does the finding.** The
+    obvious salvage — re-run the same search with a wider distance ceiling — was
+    measured on a real corpus and does not work, because ``bge-small-en-v1.5``
+    compresses everything into a narrow band. On the NCERT Science 10th upload:
+
+        on-topic questions                0.17 – 0.29
+        the strict ceiling                       0.35
+        questions the book has NOTHING on 0.36 – 0.45
+
+    There is no gap. A ceiling wide enough to rescue a half-covered question also
+    admits "the offside rule in football" (0.41) and "who is Virat Kohli" (0.46)
+    against a school science text.
+
+    What actually fails on a question like "honestly I keep forgetting, what does
+    the sphincter muscle do before my test tomorrow" is not the threshold — it is
+    that thirteen of the sixteen words are throat-clearing, so the *retrieval*
+    vector is noise. The book has the answer on two pages.
+
+    So the two indexes swap jobs. :func:`significant_terms` picks out the words
+    that actually name something in scope ("sphincter"), the full-text index finds
+    the passages carrying them, and the question's own embedding — a poor
+    retriever here, but still a fine comparator — decides which of those the
+    reader actually asked about (:func:`search_chunks_corroborated`).
+
+    Nothing survives means the material genuinely does not cover it, and the
+    caller refuses with no model call, exactly as before.
+
+    Scope discipline is the caller's ``scope_filter``, passed straight through.
+    This changes what is ASKED and which index answers, never what may be read:
+    there is no argument here that could reach a chunk the first pass could not.
+
+    Cost is two indexed queries and no model call — and no second embedding, since
+    the query vector the caller already paid for is reused as the comparator.
+    """
+    terms = await significant_terms(session, question, scope, book_ids=book_ids)
+    if not terms:
+        return []
+
+    found = await search_chunks_corroborated(
+        session,
+        query_vector,
+        terms,
+        scope,
+        top_k=settings.retrieval_candidate_k,
+        max_distance=settings.retrieval_salvage_distance,
+        book_ids=book_ids,
+    )
+    if not found:
+        return []
+
+    hits = await _enrich(session, found)
+    for hit in hits:
+        hit["loose"] = True
+        hit["matched_terms"] = terms
+    return hits
 
 
 async def _enrich(
@@ -1299,6 +1493,7 @@ async def persist_message(
     content: str,
     citations: list[dict[str, Any]] | None = None,
     intent: MessageIntent | None = None,
+    outcome: str | None = None,
 ) -> ChatMessage:
     message = ChatMessage(
         session_id=chat_session_id,
@@ -1306,6 +1501,7 @@ async def persist_message(
         content=content,
         citations=citations or [],
         intent=intent,
+        outcome=outcome,
     )
     session.add(message)
     await session.flush()
@@ -1347,6 +1543,7 @@ async def record_answer(
     chat_session_id: UUID,
     content: str,
     citations: list[dict[str, Any]],
+    outcome: str | None = None,
 ) -> None:
     """File the assistant's message after the stream has finished.
 
@@ -1357,6 +1554,10 @@ async def record_answer(
     Written once, complete. ``chat_messages`` has no UPDATE grant for anybody — a
     transcript that can be edited after the fact is not a transcript — so there is no
     placeholder row to fill in later, which is exactly why this runs at the end.
+
+    ``outcome`` rides along for the same reason the row exists at all: after a reload
+    the transcript is all there is, and a refusal that reads back as an ordinary answer
+    is a refusal the reader can no longer report.
     """
     if not content.strip():
         return
@@ -1368,6 +1569,7 @@ async def record_answer(
                 role=MessageRole.ASSISTANT,
                 content=content,
                 citations=citations,
+                outcome=outcome,
             )
             await writer.commit()
     except Exception:

@@ -232,6 +232,23 @@ async def get_result(
     )
 
 
+@router.get("/attempts/{attempt_id}/report")
+async def review_report(
+    attempt_id: UUID,
+    principal: Principal = Depends(require_attempt_author),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """What the author reads before releasing a mark: pace, and what was observed.
+
+    `require_attempt_author`, never `require_attempt_participant`. This is the one
+    payload that carries proctoring signal, and invariant 3 is that none of it reaches
+    the person who sat the paper before the author has reviewed and released it -- so
+    the guard here is the whole enforcement, and a sitter reaching this route at all
+    would be the incident.
+    """
+    return await service.review_report(session, principal, attempt_id)
+
+
 @router.post("/attempts/{attempt_id}/release")
 async def release_result(
     attempt_id: UUID,

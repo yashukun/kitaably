@@ -141,60 +141,38 @@ class ResultsRelease(StrEnum):
 
 
 class QuestionType(StrEnum):
-    """The **grading family** -- one marking code path each. Six, and no more.
+    """The **grading family** -- one marking code path each. One, now (D32).
 
-    Not the shape of the question: that is :class:`QuestionFormat`, of which there
-    are fourteen. Seven of those formats mark as ``MCQ``, because a true/false, a
-    yes/no, a fill-in-the-blank with options and a flashcard all come down to one
-    correct key among several. Giving each its own family would be six grading paths
-    nobody tests and six chances for them to drift apart (DECISIONS.md D25).
+    Kept as an enum beside :class:`QuestionFormat` rather than collapsed away, because
+    the split is what D25 got right even though the fourteen formats were not: the
+    shape a sitter sees and the code path that marks it are different questions, and
+    marking is the one place here where a silent bug is a fairness incident.
 
-    Adding a member here means adding a marking function in ``services/grading.py``.
-    ``tests/test_formats.py`` refuses a family with no grader.
+    Adding a member means adding a marking function in ``services/grading.py``, and it
+    is the expensive direction -- a family owns answers already stored, so retiring one
+    later means rewriting somebody's result. ``tests/test_formats.py`` refuses a family
+    with no grader.
     """
 
     MCQ = "mcq"
-    MULTI_SELECT = "multi_select"
-    SHORT_TEXT = "short_text"
-    MATCH = "match"
-    SEQUENCE = "sequence"
-    SUBJECTIVE = "subjective"
 
 
 class QuestionFormat(StrEnum):
     """The **shape** the author picks and the sitter sees. Mirrors
     ``public.question_format``.
 
-    Each value earns its place by having its own prompt *and* its own renderer. A
-    "definition question" has neither -- it is a ``ONE_WORD`` or a ``SHORT_ANSWER``
-    with a different instruction -- so it is not here. The long tail of question
-    kinds is steered by :class:`Difficulty` and the author's free-text brief, not by
-    enum values that render identically to one another.
+    One shape. The other thirteen were removed in 20260902120000 (DECISIONS.md D32):
+    each cost an LLM call of its own per paper, and on a CPU-only box that fan-out was
+    the difference between a paper arriving in a minute and in twenty. The remaining
+    expressiveness lives in :class:`Difficulty` and the author's free-text brief --
+    "identify the logical fallacy" is a multiple choice at ``evaluate``.
 
     The format -> family mapping lives in ``app/rag/formats.py``, and Postgres holds
     the same mapping as a check constraint. Neither is decoration: a paper drawn as
     one thing and marked as another scores zero for everybody who sat it.
     """
 
-    # --- one correct key among several (family: mcq)
     MCQ = "mcq"
-    TRUE_FALSE = "true_false"
-    YES_NO = "yes_no"
-    FILL_BLANK = "fill_blank"
-    ASSERTION_REASON = "assertion_reason"
-    SCENARIO = "scenario"
-    FLASHCARD = "flashcard"
-    # --- several correct keys (family: multi_select)
-    MULTI_SELECT = "multi_select"
-    # --- two-sided (families: match, sequence)
-    MATCH = "match"
-    SEQUENCE = "sequence"
-    # --- typed, marked deterministically (family: short_text)
-    ONE_WORD = "one_word"
-    NUMERIC = "numeric"
-    # --- typed, marked against a rubric (family: subjective)
-    SHORT_ANSWER = "short_answer"
-    LONG_ANSWER = "long_answer"
 
 
 class Difficulty(StrEnum):
@@ -238,9 +216,20 @@ class AssessmentRigor(StrEnum):
 
 
 class QuestionOrigin(StrEnum):
-    """Where a question came from. Provenance a sitter can be shown if they dispute it."""
+    """Where a question came from. Provenance a sitter can be shown if they dispute it.
+
+    ``HARVESTED`` is separate from ``GENERATED`` because the difference is one an
+    author must be able to see before they publish (D31). A generated question is the
+    model's first draft over which the author is author of record; a harvested one is
+    printed in the book and reproduced, with only its answer supplied. Those are
+    different things to publish and different things to defend.
+
+    ``EDITED`` wins over either the moment a human changes one: the question on the
+    paper is then neither the model's nor the book's.
+    """
 
     GENERATED = "generated"
+    HARVESTED = "harvested"
     EDITED = "edited"
     WRITTEN = "written"
 
@@ -259,6 +248,22 @@ class Grader(StrEnum):
     AUTO = "auto"
     LLM = "llm"
     HUMAN = "human"
+
+
+class NotificationKind(StrEnum):
+    """What a notification is about. Mirrors ``public.notification_kind``.
+
+    Every one of these is addressed to somebody who has to *act*: an author whose
+    paper was sat, an author whose paper finished generating, an author with a
+    proctoring review waiting. None of them is addressed to a sitter, and that is not
+    an oversight — a mark reaches a sitter when its author releases it, and a
+    proctoring finding reaches them only through a reviewed report (invariant 3).
+    A notification must never become the channel that outruns either gate.
+    """
+
+    ATTEMPT_SUBMITTED = "attempt_submitted"
+    ASSESSMENT_READY = "assessment_ready"
+    REVIEW_PENDING = "review_pending"
 
 
 class ProctorSessionStatus(StrEnum):

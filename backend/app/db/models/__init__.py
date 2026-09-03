@@ -15,6 +15,8 @@ from app.db.models.assessment import Assessment
 from app.db.models.attempt import Attempt
 from app.db.models.book import Book, Chapter, Chunk
 from app.db.models.chat import ChatMessage, ChatSession
+from app.db.models.feedback import ContentFeedback
+from app.db.models.notification import Notification
 from app.db.models.proctor import ProctorEvent, ProctorSession
 from app.db.models.profile import Profile
 from app.db.models.question import Question, QuestionKey, QuestionSit
@@ -28,6 +30,8 @@ __all__ = [
     "ChatMessage",
     "ChatSession",
     "Chunk",
+    "ContentFeedback",
+    "Notification",
     "ProctorEvent",
     "ProctorSession",
     "Profile",
