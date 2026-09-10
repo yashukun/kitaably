@@ -1,8 +1,8 @@
 # Kitaably
 #
-# The world comes up in three commands, because Supabase runs its own stack and the
-# model server runs on YOUR MACHINE rather than in a container:
-#     make setup-llm   then   make supabase   then   make up
+# The world comes up in two commands. Everything is in compose (DECISIONS.md D33)
+# except the model server, which runs on YOUR MACHINE rather than in a container:
+#     make setup-llm   then   make up
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -40,16 +40,8 @@ llm-check: ## Is the host's Ollama up, and can the containers reach it?
 		 print(httpx.get(u+'/api/version', timeout=5).text, '<- reachable from containers')" \
 		2>/dev/null || echo "Containers cannot reach it. Is the stack up?"
 
-.PHONY: supabase
-supabase: ## Start the Supabase CLI stack (Postgres+pgvector, Auth, Storage, Studio)
-	supabase start
-
-.PHONY: supabase-stop
-supabase-stop: ## Stop the Supabase CLI stack
-	supabase stop
-
 .PHONY: up
-up: ## Build and start the services this repo owns
+up: ## Build and start EVERYTHING -- Supabase included (DECISIONS.md D33)
 	docker compose up --build
 
 .PHONY: down
@@ -57,7 +49,9 @@ down: ## Stop them
 	docker compose down
 
 .PHONY: clean
-clean: ## Stop them and drop their volumes (redis, model cache, ollama models)
+clean: ## Stop them and drop their volumes -- INCLUDING THE DATABASE
+	@echo "This deletes the Postgres volume: every book, assessment and account."
+	@printf "Type 'yes' to continue: " && read ans && [ "$$ans" = "yes" ]
 	docker compose down -v
 
 .PHONY: logs
@@ -72,7 +66,9 @@ ps: ## Show service status
 
 .PHONY: migration
 migration: ## Create a migration:  make migration name=add_books
-	supabase migration new $(name)
+	@test -n "$(name)" || { echo "usage: make migration name=add_books"; exit 1; }
+	@f="supabase/migrations/$$(date -u +%Y%m%d%H%M%S)_$(name).sql"; \
+		printf -- "-- %s\n\n" "$(name)" > "$$f"; echo "created $$f"
 
 .PHONY: db-push
 db-push: ## Apply migrations to the linked project
@@ -80,11 +76,22 @@ db-push: ## Apply migrations to the linked project
 
 .PHONY: db-reset
 db-reset: ## Rebuild the local database from migrations, then seed
-	supabase db reset
+	@echo "This drops the database volume and rebuilds it from scratch."
+	@printf "Type 'yes' to continue: " && read ans && [ "$$ans" = "yes" ]
+	docker compose rm -sf supabase-db supabase-bootstrap supabase-seed
+	docker volume rm -f kitaably_supabase-db-data
+	docker compose up --build -d supabase-bootstrap supabase-seed
+
+# --build because the migrations are baked into the bootstrap image (supabase/Dockerfile),
+# not bind-mounted: a new file under supabase/migrations/ is not in the container until
+# the image is rebuilt. The rebuild is a COPY and takes seconds.
+.PHONY: migrate
+migrate: ## Apply any migrations not yet applied, and re-assert the buckets (no data loss)
+	docker compose up --build supabase-bootstrap
 
 .PHONY: seed
-seed: ## Load test accounts and sample material
-	supabase db reset
+seed: ## Load test accounts (skipped if auth.users is not empty)
+	docker compose up --build supabase-seed
 
 .PHONY: reingest
 reingest: ## Re-chunk and re-embed every book (run after CHUNK_TOKENS or EMBEDDING_MODEL changes)

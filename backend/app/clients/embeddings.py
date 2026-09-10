@@ -15,12 +15,15 @@ costs recall on every search — see :func:`embed_query`.
 """
 
 import asyncio
+import logging
 import weakref
 
 import httpx
 
 from app.core.config import settings
 from app.core.errors import UpstreamUnavailable
+
+logger = logging.getLogger(__name__)
 
 # Generous: the service is CPU-only and a full batch of 64 takes seconds.
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0)
@@ -86,10 +89,41 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
         except httpx.HTTPError as exc:
             # Fail loudly. Writing zero vectors would produce a book that is
             # indexed, searchable, and silently matches nothing.
+            #
+            # The exception the caller sees is deliberately vague -- it reaches a
+            # reader. This line is the operator's copy, and carries the URL and the
+            # concrete httpx error, which is the difference between "the embedding
+            # service is unavailable" and "DNS for kitaably-embeddings-service
+            # failed" or "read timeout after 120s on a batch of 64".
+            logger.error(
+                "embeddings request failed",
+                extra={
+                    "url": f"{settings.embeddings_url}/embed",
+                    "batch": len(batch),
+                    "offset": start,
+                    "total": len(texts),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
             raise UpstreamUnavailable("The embedding service is unavailable.") from exc
 
         payload = response.json()
         if payload.get("dim") != settings.embedding_dim:
+            # A dimension mismatch means the service is running a DIFFERENT MODEL
+            # from the one these books were indexed with. Silently accepting it
+            # would poison the index with vectors that are not comparable to the
+            # stored ones, so name both numbers -- this is the one embeddings
+            # failure whose fix is a config change, not a restart.
+            logger.error(
+                "embeddings dimension mismatch: the service is not running the "
+                "model this index was built with",
+                extra={
+                    "expected_dim": settings.embedding_dim,
+                    "received_dim": payload.get("dim"),
+                    "expected_model": settings.embedding_model,
+                    "received_model": payload.get("model"),
+                },
+            )
             raise UpstreamUnavailable("The embedding service returned the wrong dimension.")
         vectors.extend(payload["embeddings"])
 

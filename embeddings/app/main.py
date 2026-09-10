@@ -21,9 +21,10 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 
 from app import model
 from app.config import settings
+from app.logging import configure_logging
 from app.schemas import EmbedRequest, EmbedResponse
 
-logging.basicConfig(level=settings.log_level.upper(), format="%(message)s")
+configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
 
 embed_requests_total = Counter(
@@ -81,10 +82,34 @@ async def embed(request: EmbedRequest) -> EmbedResponse:
         vectors = await model.embed(texts)
     except Exception:
         embed_requests_total.labels("error").inc()
+        # The counter alone says a batch failed; it does not say why, and this is
+        # the only place that knows. Without the traceback the caller's
+        # "The embedding service is unavailable." is the entire record of the event.
+        logger.exception(
+            "embed failed",
+            extra={"texts": len(texts), "chars": sum(len(text) for text in texts)},
+        )
         raise
-    embed_duration_seconds.observe(time.perf_counter() - started)
+
+    elapsed = time.perf_counter() - started
+    embed_duration_seconds.observe(elapsed)
     embed_requests_total.labels("ok").inc()
     embed_texts_total.inc(len(texts))
+
+    # One line per batch, with the numbers that explain a slow ingest: how many
+    # texts, how much text, and how long the CPU took. A single-text request is a
+    # search; a 64-text one is an ingest batch, and the two have very different
+    # expected durations -- which is only visible if the count is logged.
+    logger.info(
+        "embedded",
+        extra={
+            "texts": len(texts),
+            "chars": sum(len(text) for text in texts),
+            "duration_ms": round(elapsed * 1000, 2),
+            "ms_per_text": round(elapsed * 1000 / len(texts), 2) if texts else 0.0,
+            "model": settings.embedding_model,
+        },
+    )
 
     return EmbedResponse(
         model=settings.embedding_model,

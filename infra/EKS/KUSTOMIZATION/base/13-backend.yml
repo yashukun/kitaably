@@ -1,0 +1,174 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kitaably-backend-secrets
+  namespace: kitaably
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql+asyncpg://postgres:postgres@supabase-db-service:5432/postgres"
+---
+
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: kitaably-backend-config
+  namespace: kitaably
+data:
+  APP_NAME: "Kitaably"
+  ENVIRONMENT: "development"
+  LOG_LEVEL: "INFO"
+  # Probes hit /health and /ready every 10s; a successful one is not
+  # information. Failing or slow probes still log.
+  LOG_QUIET_PROBES: "true"
+  LOG_SLOW_REQUEST_MS: "1000"
+
+  SUPABASE_URL: "http://supabase-kong-service:8000"
+  SUPABASE_JWKS_URL: "http://supabase-kong-service:8000/auth/v1/.well-known/jwks.json"
+  SUPABASE_JWT_ISSUER: "https://aws.yashagarwal.live/kong/auth/v1"
+  SUPABASE_JWT_AUDIENCE: "authenticated"
+  BUCKET_BOOKS: "books"
+  BUCKET_EVIDENCE: "evidence"
+
+  DB_POOL_SIZE: "10"
+  DB_MAX_OVERFLOW: "5"
+
+  EMBEDDINGS_URL: "http://kitaably-embeddings-service:8001"
+  EMBEDDING_MODEL: "BAAI/bge-small-en-v1.5"
+  EMBEDDING_DIM: "384"
+  EMBEDDING_BATCH_SIZE: "64"
+  EMBEDDING_MAX_TOKENS: "512"
+  EMBEDDING_QUERY_PREFIX: "Represent this sentence for searching relevant passages:"
+
+  OPENAI_BASE_URL: "http://ollama-service:11434/v1"
+  # The `-tuned` variant is created by the ollama pod at startup: same weights,
+  # with num_thread raised to the node's vCPU count. See 17-ollama.yml -- the
+  # thread count is a model parameter, so it can only arrive via the model name.
+  LLM_MODEL: "llama3.2:3b-tuned"
+  LLM_TIMEOUT_SECONDS: "120"
+  LLM_MAX_RETRIES: "3"
+  LLM_JSON_MODE: "true"
+  LLM_GENERATION_MODEL: ""
+  LLM_MAX_ANSWER_TOKENS: "500"
+
+  CHUNK_TOKENS: "320"
+  CHUNK_OVERLAP_TOKENS: "64"
+  RETRIEVAL_TOP_K: "5"
+  RETRIEVAL_CANDIDATE_K: "30"
+  RETRIEVAL_EF_SEARCH: "120"
+  RETRIEVAL_SOURCE_TOKENS: "140"
+  RETRIEVAL_MAX_DISTANCE: "0.35"
+  RETRIEVAL_SALVAGE_DISTANCE: "0.42"
+  RETRIEVAL_LEXICAL_K: "20"
+  CHAT_RATE_LIMIT_PER_MINUTE: "20"
+
+  CHAT_HISTORY_TURNS: "4"
+  CHAT_HISTORY_REPLY_CHARS: "240"
+  CHAT_BOOK_DOMINANCE: "0.62"
+  CHAT_OVERVIEW_SOURCES: "10"
+  CHAT_LOOKUP_SOURCES: "8"
+  CHAT_MULTIBOOK_MAX: "4"
+  CHAT_INTENT_LLM_FALLBACK: "false"
+  CHAT_CONDENSE_LLM: "false"
+  BOOK_CLASSIFICATION_ENABLED: "true"
+
+  ASSESSMENT_BATCH_CHUNKS: "5"
+  ASSESSMENT_OVERSAMPLE: "1.5"
+  ASSESSMENT_MIN_CHUNK_TOKENS: "60"
+  ASSESSMENT_DEDUPE_SIMILARITY: "0.92"
+  ASSESSMENT_RATE_LIMIT_PER_HOUR: "10"
+  ASSESSMENT_MAX_LLM_CALLS: "12"
+  ASSESSMENT_REPLY_MAX_TOKENS: "800"
+  ASSESSMENT_LLM_TIMEOUT_SECONDS: "180"
+  ASSESSMENT_STALE_AFTER_SECONDS: "900"
+  ASSESSMENT_BRIEF_LLM: "false"
+  ASSESSMENT_TOPIC_CHUNKS: "30"
+  ASSESSMENT_BOOK_QUESTION_SHARE: "0.4"
+  ASSESSMENT_MIN_HARVEST_QUESTIONS: "2"
+
+  MAX_UPLOAD_MB: "80"
+  MAX_PAGE_COUNT: "1200"
+  ALLOWED_SOURCE_FORMATS: "pdf,docx,pptx,txt,md,zip"
+  ZIP_MAX_MEMBERS: "64"
+  ZIP_MAX_UNCOMPRESSED_MB: "320"
+
+  EVIDENCE_RETENTION_DAYS: "60"
+  HEARTBEAT_INTERVAL_SECONDS: "15"
+  HEARTBEAT_GAP_SECONDS: "60"
+  PROCTOR_EVENT_BATCH_SECONDS: "10"
+  PROCTOR_ABANDON_SECONDS: "1800"
+
+  FRONTEND_URL: "https://aws.yashagarwal.live"
+  BACKEND_INTERNAL_URL: "http://kitaably-backend-service:8000"
+  CORS_ORIGINS: "https://aws.yashagarwal.live"
+
+  OPENAI_API_KEY: "ollama"
+
+  REDIS_URL: "redis://:admin123@redis-service:6379/0"
+  CELERY_BROKER_URL: "redis://:admin123@redis-service:6379/1"
+  CELERY_RESULT_BACKEND: "redis://:admin123@redis-service:6379/2"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kitaably-backend
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: kitaably-backend-label
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: kitaably-backend-label
+    spec:
+      containers:
+      - name: kitaably-backend-container
+        image: yashukun/kitaably-backend:latest
+        command: [ "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000" ]
+        envFrom:
+        - configMapRef:
+            name: kitaably-backend-config
+        env:
+        - name: SUPABASE_ANON_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: ANON_KEY
+        - name: SUPABASE_SERVICE_ROLE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: SERVICE_KEY
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-backend-secrets
+              key: DATABASE_URL
+        ports:
+        - containerPort: 8000
+        livenessProbe:
+          exec:
+            command: [ 'python', '-c', "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kitaably-backend-service
+  namespace: kitaably
+spec:
+  selector:
+    app: kitaably-backend-label
+  type: ClusterIP
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000

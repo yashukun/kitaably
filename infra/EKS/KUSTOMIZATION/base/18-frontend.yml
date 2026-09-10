@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kitaably-frontend
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: kitaably-frontend-label
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: kitaably-frontend-label
+    spec:
+      containers:
+      - name: kitaably-frontend
+        image: yashukun/kitaably-frontend:path-v4
+        envFrom:
+        - configMapRef:
+            name: kitaably-backend-config
+        env:
+        - name: SUPABASE_ANON_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: ANON_KEY
+        readinessProbe:
+          tcpSocket:
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        livenessProbe:
+          exec:
+            command: [ 'node', '-e', "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" ]
+          initialDelaySeconds: 20
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 5
+        ports:
+        - containerPort: 3000
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: kitaably-frontend-service
+  namespace: kitaably
+spec:
+  selector:
+    app: kitaably-frontend-label
+  type: ClusterIP
+  ports:
+  - protocol: TCP
+    port: 3000
+    targetPort: 3000

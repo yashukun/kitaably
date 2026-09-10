@@ -1,0 +1,144 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: supabase-storage
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: supabase-storage-label # has to match .spec.template.metadata.labels
+  serviceName: supabase-storage-service
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: supabase-storage-label # has to match .spec.selector.matchLabels
+    spec:
+      initContainers:
+      - name: db-init
+        image: postgres:16-alpine
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: DATABASE_URL
+        command:
+        - sh
+        - -c
+        - |
+          for i in $(seq 1 30); do
+            if psql "$DATABASE_URL" -c '\conninfo'; then
+              echo "postgres is up"
+              exit 0
+            fi
+            echo "waiting for postgres to accept connections... ($i/30)"
+            sleep 2
+          done
+          echo "postgres never became ready after 30 attempts" >&2
+          exit 1
+
+      containers:
+      - name: supabase-storage-container
+        image: public.ecr.aws/supabase/storage-api:v1.69.11
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: DATABASE_URL
+        - name: ANON_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: ANON_KEY
+        - name: SERVICE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: SERVICE_KEY
+        - name: AUTH_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: AUTH_JWT_SECRET
+        - name: JWT_JWKS
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: JWT_JWKS
+        - name: TENANT_ID
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: TENANT_ID
+        - name: REGION
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: REGION
+        - name: GLOBAL_S3_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: GLOBAL_S3_BUCKET
+        - name: STORAGE_BACKEND
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: STORAGE_BACKEND
+        - name: FILE_STORAGE_BACKEND_PATH
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: FILE_STORAGE_BACKEND_PATH
+        - name: FILE_SIZE_LIMIT
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: FILE_SIZE_LIMIT
+        - name: ENABLE_IMAGE_TRANSFORMATION
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: ENABLE_IMAGE_TRANSFORMATION
+        ports:
+        - containerPort: 5000
+        readinessProbe:
+          tcpSocket:
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        livenessProbe:
+          exec:
+            command: [ "sh", "-c", "wget --quiet --tries=1 --spider http://127.0.0.1:5000/status || exit 1" ]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        volumeMounts:
+        - name: supabase-storage-volume
+          mountPath: /var/lib/storage
+  volumeClaimTemplates:
+  - metadata:
+      name: supabase-storage-volume
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "local-path"
+      resources:
+        requests:
+          storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: supabase-storage-service
+  namespace: kitaably
+spec:
+  selector:
+    app: supabase-storage-label
+  ports:
+  - protocol: TCP
+    port: 5000
+    targetPort: 5000

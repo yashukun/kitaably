@@ -1,0 +1,73 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: kitaably-embeddings-config
+  namespace: kitaably
+data:
+  LOG_LEVEL: "INFO"
+  EMBEDDING_MODEL: "BAAI/bge-small-en-v1.5"
+  EMBEDDING_DIM: "384"
+  EMBEDDING_BATCH_SIZE: "64"
+  EMBEDDING_CPU_MEM_ARENA: "false"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kitaably-embeddings
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: kitaably-embeddings-label # has to match .spec.template.metadata.labels
+  serviceName: kitaably-embeddings-service
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: kitaably-embeddings-label # has to match .spec.selector.matchLabels
+    spec:
+      containers:
+      - name: kitaably-embeddings-container
+        image: yashukun/kitaably-embeddings
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 8001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        envFrom:
+        - configMapRef:
+            name: kitaably-embeddings-config
+        ports:
+        - containerPort: 8001
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/.cache
+  volumeClaimTemplates:
+  - metadata:
+      name: model-cache
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "local-path"
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kitaably-embeddings-service
+  namespace: kitaably
+spec:
+  selector:
+    app: kitaably-embeddings-label
+  type: ClusterIP
+  ports:
+  - protocol: TCP
+    port: 8001
+    targetPort: 8001

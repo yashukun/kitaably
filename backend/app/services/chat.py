@@ -417,6 +417,21 @@ async def prepare_turn(
 
     if not hits:
         library = await _visible_books(session, principal)
+        # A refusal is an outcome, not an error -- invariant 5 working. But it is
+        # indistinguishable from a broken retrieval in the access log, where both
+        # are a fast 200, so say which it was and what it took to decide. Without
+        # this the only visible symptom of "nothing cleared the threshold" is an
+        # empty answer in the browser.
+        logger.info(
+            "grounded refusal: nothing cleared the retrieval threshold",
+            extra={
+                "query": _clip(query, 120),
+                "max_distance": settings.retrieval_max_distance,
+                "salvage_distance": settings.retrieval_salvage_distance,
+                "books_visible": len(library),
+                "books_ready": sum(1 for book in library if book.status == BookStatus.READY),
+            },
+        )
         return Turn(
             intent=detected,
             asked=content,
@@ -1079,6 +1094,18 @@ async def _prepare_compare(
             f"vector “{_clip(profile.topic, 50)}” · {len(hits)} candidate(s)",
         )
         if not hits:
+            # Same reasoning as the content-search refusal above: a fast 200 with an
+            # empty-looking answer is otherwise indistinguishable from a failure.
+            logger.info(
+                "grounded refusal: nothing cleared the retrieval threshold",
+                extra={
+                    "query": _clip(profile.topic, 120),
+                    "max_distance": settings.retrieval_max_distance,
+                    "salvage_distance": settings.retrieval_salvage_distance,
+                    "books_searched": len(targets),
+                    "narrowed": narrowed,
+                },
+            )
             return Turn(
                 intent=detected, asked=content, query=query, history=history,
                 answer=prompts.grounded_refusal([book.title for book in targets]),

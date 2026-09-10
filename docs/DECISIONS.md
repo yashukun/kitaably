@@ -68,7 +68,7 @@ on the same instance. Beyond roughly a million chunks this decision should be re
 places that know how search works — but a move to an external store re-introduces exactly
 the deletion-consistency problem this decision buys off, so reverse deliberately.
 
-## D3 — Local development runs the Supabase CLI stack
+## D3 — Local development runs the Supabase CLI stack  *(superseded by D33)*
 
 **Choice.** `supabase start` runs Postgres + pgvector, Auth, Storage, and Studio in their
 own containers. `docker-compose.yml` runs only the services this repo owns: backend,
@@ -1284,3 +1284,69 @@ migration adding the enum value back, and a branch in `questions_format_matches_
 Re-adding a *family* additionally means deciding what happens to the archived rows in
 `retired_questions`, which no longer join to anything. Adding a seventh family should be
 as reluctant a decision as D25 said it was.
+
+## D33 — The Supabase stack is in docker-compose.yml, not the CLI  *(reverses D3)*
+
+**Choice.** Postgres, GoTrue, PostgREST, Storage, Kong, Mailpit, pg-meta and Studio are
+declared as compose services. `docker compose up` brings up the whole world; `supabase
+start` is no longer part of local development. Images are pinned to exactly what CLI
+v2.115.0 ran, so the stack is the one the project was built against.
+
+**Why.** D3's recorded cost was "two commands to bring the world up instead of one", and
+that cost was paid every day. One command, one `docker compose ps` showing every service,
+one `docker compose logs` across the whole system, and one network — the backend now
+reaches Kong at `http://supabase-kong:8000` rather than out through
+`host.docker.internal`. It also puts local development a step closer to Phase 9, where
+these are Deployments and nothing is on a host at all.
+
+**Cost, and it is real.** `supabase/config.toml` is no longer what runs. Every value in
+it that GoTrue or Storage reads is restated as an environment variable in
+`docker-compose.yml` — `minimum_password_length = 12` is `GOTRUE_PASSWORD_MIN_LENGTH`,
+`enable_confirmations = false` is `GOTRUE_MAILER_AUTOCONFIRM: "true"` (inverted), the
+rate limits are four more. **Change an auth rule in one place and the two disagree
+silently.** `config.toml` is kept, because `supabase db push` and the hosted project
+still read it, and because its comments are the reasoning — but it is now documentation
+of intent, and compose is the implementation. Also inherited: the Supabase images are
+ours to keep in step with the hosted project, and there is no `supabase start` to tell us
+we have drifted.
+
+**What replaces `supabase db reset`.** One built image, `supabase/Dockerfile`, holding
+the migrations, `buckets.sql`, `seed.sql` and the three scripts that apply them, run as
+two one-shot services. The scripts are three steps rather than one because each waits
+for a schema that some *other* service creates on its own first boot:
+
+| Service | Steps | Waits for |
+|---|---|---|
+| `supabase-bootstrap` | `migrate`: applies `supabase/migrations/*.sql` in order | Postgres healthy |
+| | `buckets`: creates `books` and `evidence`, both private | `storage.buckets`, made by Storage |
+| `supabase-seed` | `seed`: the two test accounts | `auth.users`, made by GoTrue |
+
+Everything that touches the database waits for both to **complete**, so the backend
+cannot start against a half-applied schema. Every step is idempotent: migrations skip by
+ledger, buckets upsert, the seed skips on a non-empty `auth.users`. An **empty** migration
+file is an error rather than a silently-applied no-op, which is the failure mode
+`CLAUDE.md` warns about, made loud.
+
+*Amended 2026-09-06.* This began as three services bind-mounting scripts into the
+Postgres image. They became one image so that the artefact a cluster runs as a Job is
+the artefact that ran locally — nothing mounted in, `bootstrap.sh all` and the same
+polling. The seed stays its own compose service because GoTrue waits for the migrations
+and the seed waits for GoTrue, which is a cycle inside one run; a cluster has no
+`depends_on` and runs all three steps in one Job. Storage no longer waits for the
+migrations (none touch its schema), which is what lets `supabase-bootstrap` wait for
+Storage instead. The cost: a new migration is not in the container until the image is
+rebuilt, so `make migrate` now passes `--build`. A COPY-only layer; seconds.
+
+**The signing key is the subtle part.** `core/security.py` verifies tokens against JWKS by
+`kid`, so GoTrue must sign asymmetrically — configured with a bare `GOTRUE_JWT_SECRET` it
+publishes no JWKS document and every authenticated request 401s. `GOTRUE_JWT_KEYS` carries
+the same ES256 key the CLI generated, pinned rather than regenerated: a fresh key per `up`
+would change the `kid` and silently invalidate every session still open in a browser. Its
+private half is in git, which is acceptable for exactly one reason — it is local
+development, and a hosted project uses its own key from Supabase. It must never become the
+key for anything real.
+
+**Reversal.** Cheap, and worth knowing: `supabase start` still works. Stop the compose
+Supabase services, point `SUPABASE_URL`, `SUPABASE_JWKS_URL` and `DATABASE_URL` back at
+`host.docker.internal`, and D3 is in force again — the migrations, the seed and
+`config.toml` are all still where the CLI expects them.

@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     environment: Literal["development", "staging", "production"] = "development"
     log_level: str = "INFO"
 
+    # --- Logging -----------------------------------------------------------
+    # A successful probe or metrics scrape is not information: kubelet hits
+    # /health and /ready every ten seconds, so leaving them on buries the lines
+    # that matter. A FAILING probe still logs -- that is the event worth seeing.
+    # Set false to get one line per request back when debugging routing.
+    log_quiet_probes: bool = True
+    # Anything slower than this is logged even when it succeeded, because a slow
+    # 200 is the shape most latency incidents arrive in.
+    log_slow_request_ms: float = 1000.0
+
     # --- Supabase ----------------------------------------------------------
     supabase_url: str = ""
     supabase_anon_key: str = ""
@@ -48,6 +58,10 @@ class Settings(BaseSettings):
     db_max_overflow: int = 5
 
     # --- Redis / Celery ----------------------------------------------------
+    # Credentials live in the URL, so nothing below reaches for a username or a
+    # password separately: Redis.from_url and Celery both parse them out. The
+    # defaults are unauthenticated because a default is not a deployment -- every
+    # environment that runs sets these from .env, where the ACL user is spelled out.
     redis_url: str = "redis://redis:6379/0"
     celery_broker_url: str = "redis://redis:6379/1"
     celery_result_backend: str = "redis://redis:6379/2"

@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supabase-rest
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: supabase-rest-label
+  replicas: {{ .Values.replicaCount }}
+  template:
+    metadata:
+      labels:
+        app: supabase-rest-label
+    spec:
+      containers:
+        - name: supabase-rest
+          image: public.ecr.aws/supabase/postgrest:v16.1
+          env:
+            - name: PGRST_DB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: kitaably-secrets
+                  key: DATABASE_URL_AUTHENTICATOR
+            - name: PGRST_DB_SCHEMAS
+              value: "public"
+            - name: PGRST_DB_ANON_ROLE
+              value: "anon"
+            - name: PGRST_DB_EXTRA_SEARCH_PATH
+              value: "public, extensions"
+            - name: PGRST_DB_MAX_ROWS
+              value: "1000"
+            - name: PGRST_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kitaably-secrets
+                  key: JWT_JWKS
+          ports:
+            - containerPort: 3000
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: supabase-rest-service
+  namespace: kitaably
+spec:
+  selector:
+    app: supabase-rest-label
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000

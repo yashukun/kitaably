@@ -1,0 +1,15 @@
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-kitaably
+  namespace: kitaably
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: yashagarwal.cs@gmail.com
+    privateKeySecretRef:
+      name: letsencrypt-kitaably
+    solvers:
+    - http01:
+        ingress:
+          ingressClassName: traefik

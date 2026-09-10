@@ -1,0 +1,9 @@
+# Only migrations/, seed.sql and docker/ reach the image. The rest is CLI state
+# (`supabase db push`, the hosted project) and has no business in a container.
+.branches/
+.temp/
+snippets/
+config.toml
+MIGRATIONS.md
+Dockerfile
+.dockerignore

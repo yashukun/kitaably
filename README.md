@@ -22,22 +22,27 @@ with heartbeats, uploads evidence stills, and the server scores what it saw; the
 author gets a read-only report beside the marks. Phase 8 — the review gate's
 per-event actions — is next; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-Seeded accounts after `supabase db reset`: `amina@kitaably.test` and
+Seeded accounts, loaded automatically on first start: `amina@kitaably.test` and
 `ravi@kitaably.test`, password `Passw0rd!123`.
 
 ---
 
 ## Running it
 
-Two stacks, because Supabase runs its own (`docs/DECISIONS.md` D3).
+One stack. Supabase is in compose alongside everything else
+(`docs/DECISIONS.md` D33), and the migrations, buckets and seed run themselves.
 
 ```bash
-cp .env.example .env       # fill the keys `supabase start` prints
-supabase start             # Postgres+pgvector, Auth, Storage, Studio
-docker compose up --build  # backend, worker, beat, embeddings, redis, ollama, frontend
-supabase db reset          # migrations + seed (the accounts above)
-docker compose exec ollama ollama pull llama3.2:3b   # the dev LLM, once
+cp .env.example .env       # the local keys are already in it
+make setup-llm             # the dev LLM, once -- onto the HOST, not a container
+docker compose up --build  # everything
 ```
+
+First start applies 29 migrations, creates the two private buckets and seeds the
+accounts above before the backend accepts a request; it takes a few minutes. Every
+step is idempotent, so `up` is safe to repeat. `make migrate` applies new migrations
+without touching data; `make db-reset` rebuilds from scratch and **deletes every
+book**.
 
 | Service | URL |
 |---|---|

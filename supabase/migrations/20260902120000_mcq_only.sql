@@ -119,8 +119,20 @@ alter table public.questions
 alter table public.questions
     drop constraint questions_subjective_shape;
 
--- `questions_mcq_shape` (20260824150000) survives untouched and now carries the whole
--- shape rule: an mcq needs options and a correct_option.
+-- `questions_mcq_shape` (20260824150000) names only 'mcq', which survives the
+-- narrowing -- but it still has to be dropped here, and the reason is worth stating
+-- because it is not about the VALUE.
+--
+-- A CHECK constraint binds to the TYPE OBJECT, not to the text of the literal. Step 4
+-- below renames public.question_type to question_type_old and creates a new type
+-- under the old name, so this constraint keeps pointing at question_type_old while
+-- the column becomes question_type. The ALTER COLUMN then has to evaluate
+-- `type <> 'mcq'::question_type_old` against a question_type column and fails with
+-- "operator does not exist: question_type <> question_type_old".
+--
+-- Re-added verbatim after the swap, where it re-parses against the narrowed type.
+alter table public.questions
+    drop constraint questions_mcq_shape;
 
 -- ===================================================== 3. narrow question_format
 --
@@ -165,6 +177,13 @@ alter table public.questions
     using type::text::public.question_type;
 
 drop type public.question_type_old;
+
+-- The shape rule, re-parsed against the narrowed type. Identical to the definition
+-- 20260824150000 gave it: an mcq needs options and a correct_option.
+alter table public.questions
+    add constraint questions_mcq_shape check (
+        type <> 'mcq' or (options is not null and correct_option is not null)
+    );
 
 -- ================================================ 5. the family rule, narrowed
 --

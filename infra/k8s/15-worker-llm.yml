@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kitaably-worker-llm
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: kitaably-worker-llm-label
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: kitaably-worker-llm-label
+    spec:
+      initContainers:
+      - name: redis-init
+        image: redis:alpine
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: REDIS_PASSWORD
+
+        command:
+        - sh
+        - -c
+        - |
+          until redis-cli -h redis-service -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning PING | grep -q PONG; do
+            echo "Redis not ready, retrying in 2s..."
+            sleep 2
+          done
+          echo "Redis is ready."
+      containers:
+      - name: kitaably-worker-llm
+        image: yashukun/kitaably-backend:latest
+        args: [ "celery", "-A", "app.workers.celery_app.celery_app", "worker", "--loglevel=info", "--concurrency=1", "-Q", "llm" ]
+        envFrom:
+        - configMapRef:
+            name: kitaably-backend-config
+        - secretRef:
+            name: kitaably-backend-secrets
+        env:
+        - name: SUPABASE_SERVICE_ROLE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: SERVICE_KEY
+        - name: SUPABASE_ANON_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: ANON_KEY
+        livenessProbe:
+          exec:
+            command: [ 'celery', '-A', 'app.workers.celery_app.celery_app', 'inspect', 'ping' ]
+          initialDelaySeconds: 30
+          periodSeconds: 120
+          timeoutSeconds: 10
+          failureThreshold: 3
+      restartPolicy: Always

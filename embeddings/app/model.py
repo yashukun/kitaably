@@ -12,6 +12,7 @@ event loop and stall the health endpoints of the very service being probed.
 import asyncio
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING
 
 from app.config import settings
@@ -47,6 +48,7 @@ def load() -> None:
                 "cpu_mem_arena": settings.embedding_cpu_mem_arena,
             },
         )
+        started = time.perf_counter()
         _model = TextEmbedding(
             model_name=settings.embedding_model,
             cache_dir=settings.model_cache_dir,
@@ -55,7 +57,18 @@ def load() -> None:
             # sharing its VM.
             enable_cpu_mem_arena=settings.embedding_cpu_mem_arena,
         )
-        logger.info("model loaded", extra={"model": settings.embedding_model})
+        # How long this took is the number that explains a slow rollout: it is what
+        # /ready waits on, and a cold cache (a ~130 MB download) takes tens of
+        # seconds where a warm one takes about one. Logging it turns "the pod was
+        # slow to come up" into "the model cache volume was empty".
+        logger.info(
+            "model loaded",
+            extra={
+                "model": settings.embedding_model,
+                "dim": settings.embedding_dim,
+                "load_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        )
 
 
 def _encode(texts: list[str]) -> list[list[float]]:

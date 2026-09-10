@@ -56,7 +56,7 @@ Postgres + separate-vector-DB design was an orphaned vector surviving a deleted 
 
 | | local | dev (cluster) | prod (cluster) |
 |---|---|---|---|
-| Postgres / Auth / Storage | Supabase CLI stack (`supabase start`) | Supabase hosted project | Supabase hosted project |
+| Postgres / Auth / Storage | compose services (D33) | Supabase hosted project | Supabase hosted project |
 | Backend, worker, embeddings, frontend | Docker Compose | EKS, Kustomize `overlays/dev` | EKS, Kustomize `overlays/prod` |
 | Redis | compose service | in-cluster Deployment | in-cluster (or ElastiCache) |
 | LLM | Ollama container | Ollama Deployment or OpenAI | OpenAI |

@@ -1,0 +1,87 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: supabase-studio-config
+  namespace: kitaably
+data:
+  STUDIO_PG_META_URL: "http://supabase-meta-service:8080"
+  DEFAULT_ORGANIZATION_NAME: "Kitaably"
+  DEFAULT_PROJECT_NAME: "kitaably"
+  SUPABASE_URL: "http://supabase-kong-service:8000"
+  SUPABASE_PUBLIC_URL: "http://yash.live/kong"
+  NEXT_PUBLIC_ENABLE_LOGS: "false"
+  HOSTNAME: "0.0.0.0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supabase-studio
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: supabase-studio-label
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: supabase-studio-label
+    spec:
+      containers:
+      - name: supabase-studio-container
+        image: public.ecr.aws/supabase/studio:2026.08.17-sha-0c1da8f
+
+        env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: DATABASE_PASSWORD
+        - name: SUPABASE_ANON_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: ANON_KEY
+        - name: SUPABASE_SERVICE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: SERVICE_KEY
+        - name: AUTH_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: AUTH_JWT_SECRET
+
+        envFrom:
+        - configMapRef:
+            name: supabase-studio-config
+        readinessProbe:
+          tcpSocket:
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: [ "node", "-e", "fetch('http://127.0.0.1:3000/api/platform/profile').then(r=>{if(r.status!==200)throw new Error(r.status)})" ]
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+          periodSeconds: 10
+        ports:
+        - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: supabase-studio-service
+  namespace: kitaably
+spec:
+  selector:
+    app: supabase-studio-label
+  type: ClusterIP
+  ports:
+  - protocol: TCP
+    port: 3000
+    targetPort: 3000

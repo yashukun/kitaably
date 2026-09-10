@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- 1-redis.yml
+- 2-supabase-db.yml
+- 3-supabase-storage.yml
+- 4-supabase-bootstrap.yml
+- 7-supabase-meta.yml
+- 8-supabase-auth.yml
+- 9-supabase-rest.yml
+- 9-seed-job.yml
+- 11-supabase-studio.yml
+- 12-embeddings.yml
+- 10-supabase-kong.yml
+- 13-backend.yml
+- 14-worker.yml
+- 15-worker-llm.yml
+- 16-beat.yml
+- 17-ollama.yml
+- 18-frontend.yml
+- 19-ingress.yml
+- secrets-config.yml

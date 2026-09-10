@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: supabase-auth-config
+  namespace: kitaably
+data:
+  GOTRUE_API_HOST: "0.0.0.0"
+  GOTRUE_API_PORT: "9999"
+  GOTRUE_DB_DRIVER: "postgres"
+
+  # replace with your actual external URL (ingress host)
+  API_EXTERNAL_URL: "http://yash.live/kong/auth/v1"
+  GOTRUE_JWT_ISSUER: "http://yash.live/kong/auth/v1"
+  # frontend
+  GOTRUE_SITE_URL: "http://yash.live"
+  GOTRUE_URI_ALLOW_LIST: "http://yash.live/auth/callback"
+
+  GOTRUE_JWT_VALID_METHODS: "HS256,ES256"
+  GOTRUE_JWT_AUD: "authenticated"
+  GOTRUE_JWT_DEFAULT_GROUP_NAME: "authenticated"
+  GOTRUE_JWT_ADMIN_ROLES: "service_role"
+  GOTRUE_JWT_EXP: "3600"
+
+  GOTRUE_DISABLE_SIGNUP: "false"
+  GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+  GOTRUE_PASSWORD_MIN_LENGTH: "12"
+  GOTRUE_PASSWORD_REQUIRED_CHARACTERS: ""
+  GOTRUE_SECURITY_REFRESH_TOKEN_ROTATION_ENABLED: "true"
+  GOTRUE_SECURITY_REFRESH_TOKEN_REUSE_INTERVAL: "10"
+  GOTRUE_MAILER_OTP_EXP: "3600"
+  GOTRUE_MAILER_AUTOCONFIRM: "true"
+  GOTRUE_MAILER_URLPATHS_CONFIRMATION: "http://yash.live/kong/auth/v1/verify"
+  GOTRUE_MAILER_URLPATHS_RECOVERY: "http://yash.live/kong/auth/v1/verify"
+  GOTRUE_MAILER_URLPATHS_INVITE: "http://yash.live/kong/auth/v1/verify"
+  GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: "http://yash.live/kong/auth/v1/verify"
+
+  GOTRUE_RATE_LIMIT_EMAIL_SENT: "10"
+  GOTRUE_RATE_LIMIT_TOKEN_REFRESH: "150"
+  GOTRUE_RATE_LIMIT_VERIFY: "30"
+  GOTRUE_RATE_LIMIT_ANONYMOUS_USERS: "30"
+
+  GOTRUE_SMTP_HOST: "supabase-mail"
+  GOTRUE_SMTP_PORT: "1025"
+  GOTRUE_SMTP_ADMIN_EMAIL: "admin@kitaably.test"
+  GOTRUE_SMTP_SENDER_NAME: "Kitaably"
+  GOTRUE_SMTP_MAX_FREQUENCY: "1s"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supabase-auth
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: supabase-auth-label
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: supabase-auth-label
+    spec:
+      initContainers:
+      - name: db-init
+        image: postgres:16-alpine
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: DATABASE_URL
+        command:
+        - sh
+        - -c
+        - |
+          for i in $(seq 1 30); do
+            if psql "$DATABASE_URL" -c '\conninfo'; then
+              echo "postgres is up"
+              exit 0
+            fi
+            echo "waiting for postgres to accept connections... ($i/30)"
+            sleep 2
+          done
+          echo "postgres never became ready after 30 attempts" >&2
+          exit 1
+
+      containers:
+      - name: supabase-auth-container
+        image: public.ecr.aws/supabase/gotrue:v2.195.0
+        envFrom:
+        - configMapRef:
+            name: supabase-auth-config
+        env:
+        - name: GOTRUE_DB_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: DATABASE_URL
+        - name: GOTRUE_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: kitaably-secrets
+              key: AUTH_JWT_SECRET
+        - name: GOTRUE_JWT_KEYS
+          value: '[{"kty":"EC","kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","use":"sig","key_ops":["sign","verify"],"alg":"ES256","ext":true,"d":"dIhR8wywJlqlua4y_yMq2SLhlFXDZJBCvFrY1DCHyVU","crv":"P-256","x":"M5Sjqn5zwC9Kl1zVfUUGvv9boQjCGd45G8sdopBExB4","y":"P6IXMvA2WYXSHSOMTBH2jsw_9rrzGy89FjPf6oOsIxQ"}]'
+        readinessProbe:
+          tcpSocket:
+            port: 9999
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: [ "sh", "-c", "wget --quiet --tries=1 --spider http://127.0.0.1:9999/health || exit 1" ]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        ports:
+        - containerPort: 9999
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: supabase-auth-service
+  namespace: kitaably
+spec:
+  selector:
+    app: supabase-auth-label
+  type: ClusterIP
+  ports:
+  - protocol: TCP
+    port: 9999
+    targetPort: 9999

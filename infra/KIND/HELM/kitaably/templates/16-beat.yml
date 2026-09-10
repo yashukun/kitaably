@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kitaably-beat
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: kitaably-beat-label
+  replicas: {{ .Values.replicaCount }}
+  template:
+    metadata:
+      labels:
+        app: kitaably-beat-label
+    spec:
+      containers:
+        - name: kitaably-beat-container
+          image: yashukun/kitaably-backend:latest
+          args:
+            [
+              "celery",
+              "-A",
+              "app.workers.celery_app.celery_app",
+              "beat",
+              "--loglevel=info",
+              "--schedule=/app/.state/celerybeat-schedule",
+            ]
+          envFrom:
+            - configMapRef:
+                name: kitaably-backend-config
+          livenessProbe:
+            exec:
+              command:
+                [
+                  "python",
+                  "-c",
+                  "import pathlib, sys, time; d = pathlib.Path('/app/.state'); sys.exit(0 if any(time.time() - p.stat().st_mtime < 900 for p in d.glob('celerybeat-schedule*')) else 1)",
+                ]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      restartPolicy: Always

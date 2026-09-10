@@ -1,4 +1,5 @@
 import { createServerClient } from "@supabase/ssr";
+import { isAuthApiError } from "@supabase/supabase-js";
 
 import { AUTH_COOKIE_NAME, serverSupabaseConfig } from "@/lib/supabase/config";
 import { safeNext } from "@/lib/next-path";
@@ -85,9 +86,43 @@ export async function updateSession(request: NextRequest) {
   // Do not remove: this call is what actually refreshes an expiring token.
   const {
     data: { user },
+    error,
   } = await supabase.auth.getUser();
 
   const { pathname } = request.nextUrl;
+
+  // A refresh token the server has never seen, or has already spent, is dead: no
+  // amount of retrying turns it back into a session. It happens routinely in dev —
+  // `make db-reset` drops the auth schema while a browser still holds the cookie
+  // from before — and in deploy whenever a session is revoked server-side.
+  //
+  // Left in place it is not merely untidy. The cookie survives the request, so the
+  // next one carries the same dead token, GoTrue refuses it again, and the client
+  // logs the failure again: an error per page load, for a visitor who is simply
+  // signed out. Clearing it costs one signed-out render and then stops.
+  //
+  // Only a refusal is worth acting on. A network blip reaching GoTrue says nothing
+  // about whether the token is valid, and discarding a good session on a transient
+  // error would sign people out for the length of a hiccup — so this asks whether
+  // GoTrue *answered and rejected*, rather than matching on the reason.
+  //
+  // The reason varies more than it looks: the same dead cookie comes back as
+  // `refresh_token_not_found` when GoTrue has no such token and `validation_failed`
+  // when the token is malformed — and a spent one as `refresh_token_already_used`.
+  // A 4xx from the auth server is the durable signal; the codes are not.
+  const sessionIsDead = isAuthApiError(error) && error.status >= 400 && error.status < 500;
+
+  if (sessionIsDead) {
+    // Clear on the request too, so anything running later in this same pass — a
+    // Server Component calling `getUser()` again — reads a cookie jar with no
+    // session in it, rather than retrying the same dead token.
+    for (const { name } of request.cookies.getAll()) {
+      if (name === AUTH_COOKIE_NAME || name.startsWith(`${AUTH_COOKIE_NAME}.`)) {
+        request.cookies.delete(name);
+        response.cookies.set(name, "", { path: "/", maxAge: 0 });
+      }
+    }
+  }
 
   // A redirect issued here must carry the cookies the refresh above just set, or
   // the very next request arrives with the stale token and loops.

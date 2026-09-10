@@ -77,9 +77,14 @@ jobs:
             echo "$empty"
             exit 1
           fi
+      # Still the CLI here, deliberately, even though local development moved to
+      # compose (DECISIONS.md D33). CI's job is to check the migrations against the
+      # tooling the HOSTED project uses -- if they only ever ran through our own
+      # migrate.sh, a file that works for us and breaks `supabase db push` would
+      # reach production before anyone noticed.
       - uses: supabase/setup-cli@v1
         with:
-          version: 2.115.0 # the version used locally; bump both together
+          version: 2.115.0 # the version pinned in docker-compose.yml; bump together
       - run: supabase db start
       - run: supabase db reset # every migration in order, then seed.sql
       - uses: astral-sh/setup-uv@v5

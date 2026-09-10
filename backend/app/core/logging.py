@@ -70,3 +70,19 @@ def configure_logging(level: str = "INFO") -> None:
         logger = logging.getLogger(name)
         logger.handlers.clear()
         logger.propagate = True
+
+    # uvicorn.access repeats, in a plainer form, what RequestContextMiddleware
+    # already logs with a request id, a route template and a duration. Two lines
+    # per request is not twice the information -- it is half the signal. Ours is
+    # the one that survives; uvicorn's startup and shutdown lines on `uvicorn` and
+    # `uvicorn.error` are untouched, because those are worth reading.
+    logging.getLogger("uvicorn.access").disabled = True
+
+    # Client libraries narrate every call at INFO: httpx prints a line for each
+    # embeddings and Storage request, openai for each completion. That is one to
+    # three extra lines per ingest chunk-batch, describing work our own logs
+    # already report the outcome of. Raised to WARNING, so a failing call still
+    # speaks up -- these are lifted rather than silenced, unlike uvicorn.access,
+    # because nothing else reports a connection error to a client library.
+    for name in ("httpx", "httpcore", "openai", "urllib3"):
+        logging.getLogger(name).setLevel(logging.WARNING)

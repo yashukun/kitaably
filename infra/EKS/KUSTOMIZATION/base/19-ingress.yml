@@ -1,0 +1,64 @@
+# Middleware: strips /kong before the request reaches Kong
+apiVersion: traefik.io/v1alpha1 # use traefik.containo.us/v1alpha1 if you're on an older Traefik (<v2.10-ish)
+kind: Middleware
+metadata:
+  name: strip-kong-prefix
+  namespace: kitaably
+
+spec:
+  stripPrefix:
+    prefixes:
+    - /kong
+---
+# Ingress for /kong -> supabase-kong-service, with prefix stripped
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kitaably-kong-ingress
+  namespace: kitaably
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: kitaably-strip-kong-prefix@kubernetescrd
+    cert-manager.io/cluster-issuer: letsencrypt-kitaably
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - aws.yashagarwal.live
+    secretName: kitaably-tls
+  rules:
+  - host: "aws.yashagarwal.live"
+    http:
+      paths:
+      - path: /kong
+        pathType: Prefix
+        backend:
+          service:
+            name: supabase-kong-service
+            port:
+              number: 8000
+---
+
+# Ingress for everything else -> frontend, unchanged
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kitaably-ingress
+  namespace: kitaably
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - aws.yashagarwal.live
+    secretName: kitaably-tls
+  rules:
+  - host: "aws.yashagarwal.live"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kitaably-frontend-service
+            port:
+              number: 3000

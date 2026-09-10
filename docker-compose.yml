@@ -1,261 +1,501 @@
-# Kitaably — the services this repo owns.
-#
-# Postgres, Auth, and Storage are NOT here: they come from the Supabase CLI stack
-# (DECISIONS.md D3). Two commands bring the world up:
-#
-#     supabase start        Postgres + pgvector, Auth, Storage, Studio
-#     docker compose up     backend, worker, beat, embeddings, redis, frontend
-#                           (Ollama runs on the HOST -- see `make setup-llm`)
-#
-# Containers reach the CLI stack on the host through host.docker.internal, which is
-# why DATABASE_URL and SUPABASE_URL in .env point there rather than at a service name.
-
 name: kitaably
 
-x-backend-image: &backend-image
-  # ONE image for the API, the workers, and beat — same code, same models, one
-  # build (DEPLOYMENT.md). Without an explicit `image:`, compose tags a separate
-  # image per service (kitaably-backend / -worker / -beat), and rebuilding one
-  # silently leaves the others on stale code.
-  image: kitaably-backend
-  build:
-    context: ./backend
-  env_file: [.env]
-  extra_hosts:
-    # Docker Desktop provides this automatically; the mapping keeps Linux working too.
-    - "host.docker.internal:host-gateway"
-  depends_on:
-    redis:
-      condition: service_healthy
-    embeddings:
-      condition: service_started
-  restart: unless-stopped
-
 services:
-  # ---------------------------------------------------------------- broker
+  supabase-db:
+    image: public.ecr.aws/supabase/postgres:17.6.1.159
+    environment:
+      POSTGRES_USER: supabase_admin
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_HOST: /var/run/postgresql
+      JWT_SECRET: ${SUPABASE_JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters-long}
+    ports: ["54322:5432"]
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      - ./supabase/docker/db-init/00-init.sql:/docker-entrypoint-initdb.d/z-kitaably-init.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "psql -U supabase_admin -d postgres -c 'select 1' >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  supabase-bootstrap:
+    image: kitaably-supabase
+    build: ./supabase
+    command: ["migrate", "buckets"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@supabase-db:5432/postgres
+    depends_on:
+      supabase-db: { condition: service_healthy }
+      supabase-storage: { condition: service_started }
+    restart: "no"
+
+  supabase-auth:
+    image: public.ecr.aws/supabase/gotrue:v2.195.0
+    depends_on:
+      supabase-db: { condition: service_healthy }
+      supabase-bootstrap: { condition: service_completed_successfully }
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: "9999"
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgresql://supabase_auth_admin:postgres@supabase-db:5432/postgres
+
+      API_EXTERNAL_URL: http://127.0.0.1:54321/auth/v1
+      GOTRUE_JWT_ISSUER: http://127.0.0.1:54321/auth/v1
+      GOTRUE_SITE_URL: ${FRONTEND_URL:-http://localhost:3000}
+      GOTRUE_URI_ALLOW_LIST: ${FRONTEND_URL:-http://localhost:3000}/auth/callback
+
+      GOTRUE_JWT_KEYS: ${SUPABASE_JWT_KEYS:-[{"kty":"EC","kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","use":"sig","key_ops":["sign","verify"],"alg":"ES256","ext":true,"d":"dIhR8wywJlqlua4y_yMq2SLhlFXDZJBCvFrY1DCHyVU","crv":"P-256","x":"M5Sjqn5zwC9Kl1zVfUUGvv9boQjCGd45G8sdopBExB4","y":"P6IXMvA2WYXSHSOMTBH2jsw_9rrzGy89FjPf6oOsIxQ"}]}
+      GOTRUE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters-long}
+      GOTRUE_JWT_VALID_METHODS: HS256,RS256,ES256
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_EXP: "3600"
+
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_PASSWORD_MIN_LENGTH: "12"
+      GOTRUE_PASSWORD_REQUIRED_CHARACTERS: ""
+      GOTRUE_SECURITY_REFRESH_TOKEN_ROTATION_ENABLED: "true"
+      GOTRUE_SECURITY_REFRESH_TOKEN_REUSE_INTERVAL: "10"
+      GOTRUE_MAILER_OTP_EXP: "3600"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: http://127.0.0.1:54321/auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_RECOVERY: http://127.0.0.1:54321/auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_INVITE: http://127.0.0.1:54321/auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: http://127.0.0.1:54321/auth/v1/verify
+
+      GOTRUE_RATE_LIMIT_EMAIL_SENT: "10"
+      GOTRUE_RATE_LIMIT_TOKEN_REFRESH: "150"
+      GOTRUE_RATE_LIMIT_VERIFY: "30"
+      GOTRUE_RATE_LIMIT_ANONYMOUS_USERS: "30"
+
+      GOTRUE_SMTP_HOST: supabase-mail
+      GOTRUE_SMTP_PORT: "1025"
+      GOTRUE_SMTP_ADMIN_EMAIL: admin@kitaably.test
+      GOTRUE_SMTP_SENDER_NAME: Kitaably
+      GOTRUE_SMTP_MAX_FREQUENCY: 1s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:9999/health",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  supabase-rest:
+    image: public.ecr.aws/supabase/postgrest:v16.1
+    depends_on:
+      supabase-db: { condition: service_healthy }
+      supabase-bootstrap: { condition: service_completed_successfully }
+    environment:
+      PGRST_DB_URI: postgresql://authenticator:postgres@supabase-db:5432/postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+      PGRST_DB_MAX_ROWS: "1000"
+      PGRST_JWT_SECRET: ${SUPABASE_JWKS_VERIFY:-{"keys":[{"kty":"EC","kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","use":"sig","key_ops":["verify"],"alg":"ES256","ext":true,"crv":"P-256","x":"M5Sjqn5zwC9Kl1zVfUUGvv9boQjCGd45G8sdopBExB4","y":"P6IXMvA2WYXSHSOMTBH2jsw_9rrzGy89FjPf6oOsIxQ"},{"kty":"oct","k":"c3VwZXItc2VjcmV0LWp3dC10b2tlbi13aXRoLWF0LWxlYXN0LTMyLWNoYXJhY3RlcnMtbG9uZw"}]}}
+    restart: unless-stopped
+
+  supabase-storage:
+    image: public.ecr.aws/supabase/storage-api:v1.69.11
+    depends_on:
+      supabase-db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql://supabase_storage_admin:postgres@supabase-db:5432/postgres
+      ANON_KEY: ${SUPABASE_ANON_KEY}
+      SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${SUPABASE_JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters-long}
+      JWT_JWKS: ${SUPABASE_JWKS_VERIFY:-{"keys":[{"kty":"EC","kid":"b81269f1-21d8-4f2e-b719-c2240a840d90","use":"sig","key_ops":["verify"],"alg":"ES256","ext":true,"crv":"P-256","x":"M5Sjqn5zwC9Kl1zVfUUGvv9boQjCGd45G8sdopBExB4","y":"P6IXMvA2WYXSHSOMTBH2jsw_9rrzGy89FjPf6oOsIxQ"},{"kty":"oct","k":"c3VwZXItc2VjcmV0LWp3dC10b2tlbi13aXRoLWF0LWxlYXN0LTMyLWNoYXJhY3RlcnMtbG9uZw"}]}}
+      TENANT_ID: stub
+      REGION: local
+      GLOBAL_S3_BUCKET: stub
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      FILE_SIZE_LIMIT: "83886080"
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+    volumes:
+      - supabase-storage-data:/var/lib/storage
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://127.0.0.1:5000/status",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  supabase-seed:
+    image: kitaably-supabase
+    build: ./supabase
+    command: ["seed"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@supabase-db:5432/postgres
+    depends_on:
+      supabase-bootstrap: { condition: service_completed_successfully }
+      supabase-auth: { condition: service_started }
+    restart: "no"
+
+  supabase-kong:
+    image: public.ecr.aws/supabase/kong:2.8.1
+    depends_on:
+      supabase-auth: { condition: service_started }
+      supabase-rest: { condition: service_started }
+      supabase-storage: { condition: service_started }
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_PLUGINS: request-transformer,cors
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_NGINX_WORKER_PROCESSES: "1"
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+    ports: ["54321:8000"]
+    volumes:
+      - ./supabase/docker/kong.yml:/home/kong/kong.yml:ro
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  supabase-mail:
+    image: public.ecr.aws/supabase/mailpit:v1.30.2
+    ports: ["54324:8025"]
+    restart: unless-stopped
+
+  supabase-meta:
+    image: public.ecr.aws/supabase/postgres-meta:v0.98.0
+    depends_on:
+      supabase-db: { condition: service_healthy }
+    environment:
+      PG_META_PORT: "8080"
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PORT: "5432"
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: postgres
+      PG_META_DB_PASSWORD: postgres
+    restart: unless-stopped
+
+  supabase-studio:
+    image: public.ecr.aws/supabase/studio:2026.08.17-sha-0c1da8f
+    depends_on:
+      supabase-meta: { condition: service_started }
+      supabase-kong: { condition: service_started }
+    environment:
+      STUDIO_PG_META_URL: http://supabase-meta:8080
+      POSTGRES_PASSWORD: postgres
+      DEFAULT_ORGANIZATION_NAME: Kitaably
+      DEFAULT_PROJECT_NAME: kitaably
+      SUPABASE_URL: http://supabase-kong:8000
+      SUPABASE_PUBLIC_URL: http://127.0.0.1:54321
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      AUTH_JWT_SECRET: ${SUPABASE_JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters-long}
+      NEXT_PUBLIC_ENABLE_LOGS: "false"
+      HOSTNAME: 0.0.0.0
+    ports: ["54323:3000"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'node -e "fetch(''http://127.0.0.1:3000/api/platform/profile'').then(r=>{if(r.status!==200)throw new Error(r.status)})"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+    environment:
+      REDIS_PASSWORD: local-redis-dev-password
     ports: ["6379:6379"]
-    volumes:
-      - redis-data:/data
+    volumes: [redis-data:/data]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        [
+          "CMD-SHELL",
+          'redis-cli --pass "$$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG',
+        ]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 20s
     restart: unless-stopped
 
-  # ------------------------------------------------------------ embeddings
   embeddings:
-    build:
-      context: ./embeddings
-    env_file: [.env]
+    build: ./embeddings
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-64}
+      EMBEDDING_CPU_MEM_ARENA: ${EMBEDDING_CPU_MEM_ARENA:-false}
     ports: ["8001:8001"]
-    # The second line of defence behind EMBEDDING_CPU_MEM_ARENA=false, and the reason
-    # it exists is that the first line is a setting somebody can turn back on. This
-    # service and Ollama share one Docker VM; an allocator that grows without bound in
-    # here is a model server that thrashes over there, which is not a failure either
-    # service reports — generation just gets slow and times out. A ceiling turns that
-    # silent starvation into a loud restart of the service actually at fault.
-    # Phase 9 gives every service one of these as a k8s resource limit; this is that,
-    # early, for the one service that demonstrably needed it.
     mem_limit: 1g
-    volumes:
-      # Weights and the hub download cache are both under here; keep them across
-      # restarts so a container recreate is not a 130 MB download.
-      - embeddings-cache:/app/.cache
+    volumes: [embeddings-cache:/app/.cache]
     healthcheck:
-      # /health, not /ready: this probe answers "is the process alive". The model
-      # takes seconds to load, and a liveness check that failed during that window
-      # would restart the container forever.
-      #
-      # 30s, not 10s: every probe here execs a fresh Python interpreter, and across
-      # this file the probes alone were a steady double-digit CPU spike on an idle
-      # stack. Liveness on a laptop does not need a 10-second answer.
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')",
+        ]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 60s
     restart: unless-stopped
 
-  # ----------------------------------------------------------------- api
   backend:
-    <<: *backend-image
-    ports: ["8000:8000"]
+    image: kitaably-backend
+    build: ./backend
     command:
-      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+      ]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://:local-redis-dev-password@redis:6379/0
+      CELERY_BROKER_URL: redis://:local-redis-dev-password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:local-redis-dev-password@redis:6379/2
+      OPENAI_BASE_URL: http://ollama:11434/v1
+    ports: ["8000:8000"]
     volumes:
       - ./backend/app:/app/app
+    depends_on:
+      redis: { condition: service_healthy }
+      embeddings: { condition: service_started }
+      ollama: { condition: service_started }
+      supabase-kong: { condition: service_started }
+      supabase-bootstrap: { condition: service_completed_successfully }
+      supabase-seed: { condition: service_completed_successfully }
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 20s
+    restart: unless-stopped
 
-  # -------------------------------------------------------------- workers
-  # Two workers locally: the llm queue on its own, at concurrency ONE. Ollama
-  # serves one request at a time (OLLAMA_NUM_PARALLEL=1, there is one CPU to
-  # serve with), so two generation tasks in flight do not run in parallel — the
-  # second queues at Ollama while its own 180s request timeout burns, and both
-  # papers come back full of timed-out calls. Observed live: two 10-question
-  # papers generating at once turned minutes of work into failures for both.
-  # In the cluster these are separate Deployments anyway, so a 600-page ingest
-  # cannot starve exam-time aggregation; this mirrors that split at home.
   worker:
-    <<: *backend-image
+    image: kitaably-backend
+    build: ./backend
     command:
-      - celery
-      - -A
-      - app.workers.celery_app.celery_app
-      - worker
-      - --loglevel=info
-      - --concurrency=2
-      - -Q
-      - ingest,proctor,maintenance
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app.celery_app",
+        "worker",
+        "--loglevel=info",
+        "--concurrency=2",
+        "-Q",
+        "ingest,proctor,maintenance",
+      ]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://:local-redis-dev-password@redis:6379/0
+      CELERY_BROKER_URL: redis://:local-redis-dev-password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:local-redis-dev-password@redis:6379/2
+      OPENAI_BASE_URL: http://ollama:11434/v1
     volumes:
       - ./backend/app:/app/app
+    depends_on:
+      redis: { condition: service_healthy }
+      embeddings: { condition: service_started }
+      ollama: { condition: service_started }
+      supabase-kong: { condition: service_started }
+      supabase-bootstrap: { condition: service_completed_successfully }
+      supabase-seed: { condition: service_completed_successfully }
     healthcheck:
-      # 2 minutes, not 30s: `celery inspect ping` execs a process that imports the
-      # entire app and round-trips the broker — the single most expensive probe in
-      # this file, and it was running twice a minute per worker.
-      test: ["CMD", "celery", "-A", "app.workers.celery_app.celery_app", "inspect", "ping"]
+      test:
+        [
+          "CMD",
+          "celery",
+          "-A",
+          "app.workers.celery_app.celery_app",
+          "inspect",
+          "ping",
+        ]
       interval: 120s
       timeout: 10s
       retries: 3
       start_period: 30s
+    restart: unless-stopped
 
   worker-llm:
-    <<: *backend-image
+    image: kitaably-backend
+    build: ./backend
     command:
-      - celery
-      - -A
-      - app.workers.celery_app.celery_app
-      - worker
-      - --loglevel=info
-      # One at a time is the whole point — see the note above.
-      - --concurrency=1
-      - -Q
-      - llm
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app.celery_app",
+        "worker",
+        "--loglevel=info",
+        "--concurrency=1",
+        "-Q",
+        "llm",
+      ]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://:local-redis-dev-password@redis:6379/0
+      CELERY_BROKER_URL: redis://:local-redis-dev-password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:local-redis-dev-password@redis:6379/2
+      OPENAI_BASE_URL: http://ollama:11434/v1
     volumes:
       - ./backend/app:/app/app
+    depends_on:
+      redis: { condition: service_healthy }
+      embeddings: { condition: service_started }
+      ollama: { condition: service_started }
+      supabase-kong: { condition: service_started }
+      supabase-bootstrap: { condition: service_completed_successfully }
+      supabase-seed: { condition: service_completed_successfully }
     healthcheck:
-      # Same cost, same reasoning as the worker's probe above.
-      test: ["CMD", "celery", "-A", "app.workers.celery_app.celery_app", "inspect", "ping"]
+      test:
+        [
+          "CMD",
+          "celery",
+          "-A",
+          "app.workers.celery_app.celery_app",
+          "inspect",
+          "ping",
+        ]
       interval: 120s
       timeout: 10s
       retries: 3
       start_period: 30s
+    restart: unless-stopped
 
   beat:
-    <<: *backend-image
+    image: kitaably-backend
+    build: ./backend
     command:
-      - celery
-      - -A
-      - app.workers.celery_app.celery_app
-      - beat
-      - --loglevel=info
-      # Beat writes a shelve of last-run times. Default is the CWD, which is
-      # root-owned by design, so point it at the image's one writable directory.
-      - --schedule=/app/.state/celerybeat-schedule
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app.celery_app",
+        "beat",
+        "--loglevel=info",
+        "--schedule=/app/.state/celerybeat-schedule",
+      ]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://:local-redis-dev-password@redis:6379/0
+      CELERY_BROKER_URL: redis://:local-redis-dev-password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:local-redis-dev-password@redis:6379/2
+    extra_hosts: ["host.docker.internal:host-gateway"]
     volumes:
       - ./backend/app:/app/app
       - beat-state:/app/.state
+    depends_on:
+      redis: { condition: service_healthy }
+      embeddings: { condition: service_started }
+      supabase-kong: { condition: service_started }
+      supabase-bootstrap: { condition: service_completed_successfully }
+      supabase-seed: { condition: service_completed_successfully }
     healthcheck:
-      # Beat does not answer `celery inspect ping` -- it publishes, it does not
-      # consume. What it does do is sync its schedule to disk at least every
-      # max_interval (5 min), so a stale file means beat has wedged. Without this
-      # the container reports Up while the evidence purge quietly stops running.
       test:
-        - CMD
-        - python
-        - -c
-        - |
-          import pathlib, sys, time
-          f = pathlib.Path("/app/.state/celerybeat-schedule")
-          candidates = [f, *f.parent.glob("celerybeat-schedule*")]
-          fresh = [p for p in candidates if p.exists() and time.time() - p.stat().st_mtime < 900]
-          sys.exit(0 if fresh else 1)
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import pathlib, sys, time; d = pathlib.Path('/app/.state'); sys.exit(0 if any(time.time() - p.stat().st_mtime < 900 for p in d.glob('celerybeat-schedule*')) else 1)",
+        ]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 120s
+    restart: unless-stopped
 
-  # -------------------------------------------------------------- local LLM
-  #
-  # OFF BY DEFAULT, behind a profile. Start it with:  docker compose --profile gpu up
-  #
-  # On Apple Silicon you almost certainly do NOT want this. Docker Desktop runs a Linux
-  # VM that cannot see the Mac's GPU (`ls /dev/dri` in here is empty), so this service
-  # is CPU-only inside a guest while a host-side Ollama gets Metal and every GPU core.
-  # Measured on the same model and prompt: host 9.4 tok/s, this container could not
-  # finish 60 tokens in 170 seconds. The gap is hardware access, not tuning -- giving
-  # the VM more CPU or RAM does not close it, because the cores it is missing are the
-  # GPU's.
-  #
-  # So the default is `OPENAI_BASE_URL=http://host.docker.internal:11434/v1` and you
-  # run Ollama on the host (`make setup-llm`). This service stays for the case it is
-  # actually good for: a Linux host with a real GPU passed through, where you would
-  # point OPENAI_BASE_URL back at http://ollama:11434/v1 and add a `deploy.resources`
-  # device reservation below.
   ollama:
-    profiles: ["gpu"]
     image: ollama/ollama:latest
     ports: ["11434:11434"]
-    volumes:
-      - ollama-models:/root/.ollama
-    restart: unless-stopped
+    volumes: [ollama-models:/root/.ollama]
     environment:
-      # Long enough that a working session never pays a cold load mid-conversation,
-      # short enough that the weights (~2 GB for the 3B) do not sit resident all
-      # day after one question. The cold load lands on the first question after a
-      # break -- measured at 8.2s for an 8B, a few seconds for the 3B -- and 24h
-      # was measured too: it kept 2 GB pinned on an 11 GB Docker VM overnight.
       OLLAMA_KEEP_ALIVE: 30m
-      # The context is divided BETWEEN parallel slots, so the default parallelism was
-      # quietly halving it: a 4096 window served as 2048 per request, and the tutor
-      # prompt was silently truncated to fit -- sources dropped, with no error and
-      # nothing in the answer to say half the evidence never arrived. One slot on a
-      # CPU box anyway; there is no second core group to serve a second request with.
       OLLAMA_NUM_PARALLEL: "1"
-      # Sized to the prompt this app actually builds: system + five ~320-token
-      # sources + six turns of transcript, with room to spare. Bigger is not free --
-      # the KV cache is allocated up front and scanned per token.
       OLLAMA_CONTEXT_LENGTH: "4096"
-    # This volume is the container's own: a model on the HOST's Ollama is not visible
-    # in here and would have to be pulled again.
-    #     docker compose --profile gpu exec ollama ollama pull llama3.2:3b
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:11434/ || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
 
-  # --------------------------------------------------------------- frontend
   frontend:
+    image: yashukun/kitaably-frontend
     build:
       context: ./frontend
       args:
-        # NEXT_PUBLIC_* is compiled into the browser bundle at build time, so these
-        # are build args rather than runtime environment. Only public values.
         NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
         NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
         NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME}
     environment:
-      # Server-side only: the target of the /api/backend/:path* rewrite.
       BACKEND_INTERNAL_URL: http://backend:8000
-      # Also server-side only. The browser reaches Supabase at 127.0.0.1; this
-      # container cannot, so its own calls go through host.docker.internal.
       SUPABASE_URL: ${SUPABASE_URL}
       SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
     ports: ["3000:3000"]
     depends_on:
-      - backend
+      backend: { condition: service_started }
+      supabase-kong: { condition: service_started }
     healthcheck:
-      # Without this, a container that boots and then 500s on every request still
-      # reports "Up" — which is exactly how a broken frontend hid here once.
       test:
-        - CMD
-        - node
-        - -e
-        - "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -263,6 +503,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  supabase-db-data:
+  supabase-storage-data:
   redis-data:
   embeddings-cache:
   beat-state:

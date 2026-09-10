@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: kitaably
+spec:
+  selector:
+    matchLabels:
+      app: redis-selector
+  serviceName: "redis-service"
+  replicas: {{ .Values.replicaCount }}
+  template:
+    metadata:
+      labels:
+        app: redis-selector
+    spec:
+      containers:
+        - name: redis-container
+          image: redis:7-alpine
+          command: ["sh", "-c", "redis-server --requirepass $REDIS_PASSWORD"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kitaably-secrets
+                  key: REDIS_PASSWORD
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: redis-volume
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                [
+                  "sh",
+                  "-c",
+                  'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping | grep -q PONG',
+                ]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-volume
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "local-path"
+        resources:
+          requests:
+            storage: 1Gi
+
+
+# ---
+
+# apiVersion: storage.k8s.io/v1
+# kind: StorageClass
+# metadata:
+#   name: redis-volume
+#   namespace: kitaably
+# provisioner: ebs.csi.aws.com
+# volumeBindingMode: WaitForFirstConsumer
+# parameters:
+#   type: gp3
+#   encrypted: "true"
+# reclaimPolicy: Delete
+# allowVolumeExpansion: true
+# ---
+
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: redis-pvc
+#   namespace: kitaably
+# spec:
+#   accessModes:
+#   - ReadWriteOnce
+#   storageClassName: gp3
+#   resources:
+#     requests:
+#       storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: kitaably
+spec:
+  selector:
+    app: redis-selector
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+  type: ClusterIP
