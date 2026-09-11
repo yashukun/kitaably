@@ -1,36 +1,82 @@
 # Kitaably
 
-A study platform built on the books its users actually work from.
+**A study platform built on the books its users actually work from.**
 
-You upload the books you are studying from. They become (a) a tutor you can question —
-a private upload answers only to its owner — and (b), once you share them, a source for
-auto-generated assessments, sat under camera-based proctoring, with the assessment's
-author reviewing the report before it reaches the person who sat it.
+![CI](https://github.com/yashukun/kitaably/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi&logoColor=white)
+![Next.js](https://img.shields.io/badge/frontend-Next.js-000000?logo=nextdotjs&logoColor=white)
+![Postgres](https://img.shields.io/badge/postgres-pgvector-4169E1?logo=postgresql&logoColor=white)
+![Celery](https://img.shields.io/badge/queue-Celery%20%2B%20Redis-37814A?logo=celery&logoColor=white)
+![License](https://img.shields.io/badge/status-personal%20project-lightgrey)
 
-There is one kind of account. Everyone can upload, share, author an assessment, and sit
-one — see [`docs/DECISIONS.md`](docs/DECISIONS.md) D16 for why roles and classrooms were
-removed, and what that cost.
+You upload the books you are studying from. They become **(a)** a tutor you can
+question — a private upload answers only to its owner — and **(b)**, once you share
+them, a source for auto-generated assessments, sat under camera-based proctoring, with
+the assessment's author reviewing the report before it reaches the person who sat it.
+
+```mermaid
+flowchart LR
+    U[Upload a book] --> T["Private tutor\n(yours alone)"]
+    U -- share --> C[Canon library]
+    C --> G[Generate assessment]
+    G --> Sit["Sit it\n(camera-proctored)"]
+    Sit --> Rev[Author reviews the report]
+    Rev --> Rel[Release]
+    Rel --> Out[Sitter sees marks + feedback]
+```
+
+There is **one kind of account**. Everyone can upload, share, author an assessment, and
+sit one — see [`docs/DECISIONS.md`](docs/DECISIONS.md) D16 for why roles and classrooms
+were removed, and what that cost.
 
 Design and rationale live in [`docs/`](docs/); the invariants that must not be traded
 away live in [`CLAUDE.md`](CLAUDE.md).
 
-**Status: Phases 0–6 complete; Phase 7 (proctoring capture) is built in the working
-tree.** Sign-up, sign-in and password recovery, upload, share, grounded cited chat,
-assessment generation and sitting all work end to end against a live database. The
-exam runner now opens a camera session with consent, batches debounced observations
-with heartbeats, uploads evidence stills, and the server scores what it saw; the
-author gets a read-only report beside the marks. Phase 8 — the review gate's
-per-event actions — is next; see [`docs/ROADMAP.md`](docs/ROADMAP.md).
+---
+
+## Where it stands
+
+Phases 0–6 are built and were driven end to end in a browser against a live database:
+sign-up, sign-in, password recovery, upload, share, grounded cited chat, assessment
+generation and sitting. Phase 7 is underway in the working tree.
+
+| Phase | What | Status |
+|:-:|---|:-:|
+| 0 | Skeleton and local platform | done |
+| 1 | Identity | done |
+| 2 | The sharing boundary | done |
+| 3 | Ingestion and the scoping boundary | done |
+| 4 | Grounded chat | done |
+| 5 | Assessment generation | done |
+| 6 | Taking an assessment, unproctored | done |
+| 7 | **Proctoring capture** | in progress |
+| 8 | The review gate | next |
+| 9 | Kubernetes | started — flat manifests in [`infra/k8s/`](infra/k8s/) |
+| 10 | Terraform and continuous delivery | planned |
+| 11 | Observability and hardening | planned |
+
+Full detail, exit criteria, and the two-track (Ship / Learn) breakdown per phase live in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+**Phase 7 so far:** the exam runner opens a camera session with consent, runs a
+MediaPipe loop with debounced heuristics, batches observations with heartbeats, uploads
+evidence stills for high-severity events, and the server recomputes severity and an
+integrity score from those events rather than trusting the client. The author gets a
+read-only report beside the marks — Phase 8 adds the per-event dismiss/uphold actions
+that turn that report into something releasable.
 
 Seeded accounts, loaded automatically on first start: `amina@kitaably.test` and
-`ravi@kitaably.test`, password `Passw0rd!123`.
+`ravi@kitaably.test`, password `Passw0rd!123`. Two of them, because the property worth
+checking by eye is that one cannot see the other's personal books.
 
 ---
 
 ## Running it
 
 One stack. Supabase is in compose alongside everything else
-(`docs/DECISIONS.md` D33), and the migrations, buckets and seed run themselves.
+([`docs/DECISIONS.md`](docs/DECISIONS.md) D33), and the migrations, buckets and seed run
+themselves.
 
 ```bash
 cp .env.example .env       # the local keys are already in it
@@ -39,17 +85,16 @@ docker compose up --build  # everything
 ```
 
 First start applies 29 migrations, creates the two private buckets and seeds the
-accounts above before the backend accepts a request; it takes a few minutes. Every
-step is idempotent, so `up` is safe to repeat. `make migrate` applies new migrations
-without touching data; `make db-reset` rebuilds from scratch and **deletes every
-book**.
+accounts above before the backend accepts a request; it takes a few minutes. Every step
+is idempotent, so `up` is safe to repeat. `make migrate` applies new migrations without
+touching data; `make db-reset` rebuilds from scratch and **deletes every book**.
 
 | Service | URL |
 |---|---|
-| frontend | http://localhost:3000 |
-| backend docs | http://localhost:8000/docs |
-| backend readiness | http://localhost:8000/ready |
-| embeddings | http://localhost:8001/health |
+| Frontend | http://localhost:3000 |
+| Backend docs | http://localhost:8000/docs |
+| Backend readiness | http://localhost:8000/ready |
+| Embeddings | http://localhost:8001/health |
 | Supabase Studio | http://localhost:54323 |
 | Supabase API | http://localhost:54321 |
 | Ollama | http://localhost:11434 |
@@ -57,14 +102,37 @@ book**.
 `make help` lists every target. To work outside containers: `make sync`, then
 `make dev-backend`, `make dev-embeddings`, `make dev-frontend`.
 
-Requires the [Supabase CLI](https://supabase.com/docs/guides/local-development),
-Docker, `uv`, and Node 20+. The backend answers `/health` without Supabase running;
-`/ready` reports `degraded` until Postgres is up, which is the correct behaviour and
-worth seeing once.
+Requires the [Supabase CLI](https://supabase.com/docs/guides/local-development), Docker,
+`uv`, and Node 20+. The backend answers `/health` without Supabase running; `/ready`
+reports `degraded` until Postgres is up, which is the correct behaviour and worth seeing
+once.
+
+---
+
+## Stack
+
+| Layer | Choice |
+|---|---|
+| Frontend | Next.js App Router, TypeScript, Tailwind v4 |
+| Backend | FastAPI, Python 3.12, async SQLAlchemy 2.x |
+| Relational + vectors | Supabase Postgres + `pgvector` — one database |
+| Auth | Supabase Auth (JWT via JWKS); identity from `profiles`, never a claim |
+| Storage | Supabase Storage; private buckets `books`, `evidence` |
+| Queue | Redis + Celery + beat — `ingest`, `llm`, `proctor`, `maintenance` |
+| Embeddings | `bge-small-en-v1.5`, CPU, separate service over HTTP |
+| LLM | OpenAI-compatible client — Ollama in dev, OpenAI in deploy |
+| Proctoring | MediaPipe, browser-side; server aggregates and scores |
+| Deploy | EKS, Kustomize base + overlays, Terraform, GitHub Actions |
+
+Fixed by `.env.example`; treat as decided. Rationale and reversal cost per choice live
+in [`docs/DECISIONS.md`](docs/DECISIONS.md) — read it before overturning anything.
 
 ---
 
 ## The tree
+
+<details>
+<summary>Expand the full layout</summary>
 
 ```
 .
@@ -147,18 +215,21 @@ worth seeing once.
 │   ├── 00-auth … 08-cleanup/   numbered because each folder feeds the next
 │   └── 07-boundaries/          nine requests that pass by being refused
 │
-├── infra/                      Phases 9–11; READMEs describe what lands where
-│   ├── k8s/                    kustomize base/ + overlays/{dev,prod}
-│   ├── terraform/              modules/ + envs/{dev,prod}
-│   └── monitoring/             prometheus rules, dashboards, runbooks
+├── infra/                      Phases 9–11
+│   ├── k8s/                    Supabase stack + app services — flat manifests so far;
+│   │                           the kustomize base/overlays split lands with Phase 9
+│   ├── terraform/               modules/ + envs/{dev,prod}
+│   └── monitoring/              prometheus rules, dashboards, runbooks
 │
 ├── .github/workflows/          ci.yml, cd.yml, terraform.yml
 ├── docs/                       architecture, data model, roadmap, decisions, deployment
-├── .claude/skills/             subsystem playbooks — read before touching that area
+├── .claude/skills/              subsystem playbooks — read before touching that area
 ├── docker-compose.yml          the services this repo owns (not Supabase)
 ├── Makefile
 └── .env.example
 ```
+
+</details>
 
 ## Where the rules live
 
@@ -176,17 +247,16 @@ worth seeing once.
 Four files carry more weight than their size suggests:
 
 - [`backend/app/rag/retrieve.py`](backend/app/rag/retrieve.py) — the only place a
-  predicate over `chunks` is built. A personal book stays personal because of this
-  file.
-- [`backend/app/core/deps.py`](backend/app/core/deps.py) — every route declares a
-  guard from here. A route with no guard is a review failure.
-- [`backend/tests/test_scoping.py`](backend/tests/test_scoping.py) — the cases that
-  must pass before any scoping change merges. The one that matters most asserts that
-  two users' filters are identical once their ids are masked: there is no account
-  whose reach is wider, so there is no account to escalate into.
-- [`backend/app/rag/formats.py`](backend/app/rag/formats.py) — the registry mapping
-  each question format to the grading family that marks it. One entry since D32 cut
-  fourteen formats to multiple choice alone, but the shape survives on purpose: format
-  and family are checked against each other here and in a Postgres constraint, because
-  a paper drawn as one thing and marked as another scores zero for everybody who sat
-  it while looking completely normal.
+  predicate over `chunks` is built. A personal book stays personal because of this file.
+- [`backend/app/core/deps.py`](backend/app/core/deps.py) — every route declares a guard
+  from here. A route with no guard is a review failure.
+- [`backend/tests/test_scoping.py`](backend/tests/test_scoping.py) — the cases that must
+  pass before any scoping change merges. The one that matters most asserts that two
+  users' filters are identical once their ids are masked: there is no account whose
+  reach is wider, so there is no account to escalate into.
+- [`backend/app/rag/formats.py`](backend/app/rag/formats.py) — the registry mapping each
+  question format to the grading family that marks it. One entry since D32 cut fourteen
+  formats to multiple choice alone, but the shape survives on purpose: format and family
+  are checked against each other here and in a Postgres constraint, because a paper
+  drawn as one thing and marked as another scores zero for everybody who sat it while
+  looking completely normal.
